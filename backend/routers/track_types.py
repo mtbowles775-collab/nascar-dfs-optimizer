@@ -1,7 +1,5 @@
 # ============================================================
 # routers/track_types.py
-# GET /api/track-types
-# GET /api/track-types/{name}/summary   ← powers Track Insights panel
 # ============================================================
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -28,47 +26,88 @@ def list_track_types(db: Session = Depends(get_db)):
 
 @router.get("/{track_type_name}/summary")
 def get_track_type_summary(track_type_name: str, db: Session = Depends(get_db)):
-    """
-    Historical summary stats for a track type.
-    Powers the Track Insights sidebar panel in the frontend.
-    """
-    row = (
-        db.query(
-            TrackType.name.label("track_type"),
-            func.count(func.distinct(Race.id)).label("total_races"),
-            func.avg(Result.dk_points).filter(Result.finish_position == 1).label("avg_winner_dk"),
-            func.max(Result.dk_points).label("max_dk_ever"),
-            func.avg(Result.laps_led).filter(Result.finish_position == 1).label("avg_winner_laps_led"),
-            func.avg(Result.dk_points).filter(Result.laps_led >= 50).label("avg_dominator_dk"),
-            (
-                func.count(Result.id).filter(
-                    Result.finish_position == 1,
-                    Result.start_position <= 5
-                ).cast(db.bind.dialect.name == "postgresql" and "float" or "float")
-                /
-                func.nullif(
-                    func.count(Result.id).filter(Result.finish_position == 1), 0
-                ) * 100
-            ).label("chalk_win_rate"),
-        )
-        .join(Track, Result.race_id == Race.id)  # via Race
-        .join(Race, Result.race_id == Race.id)
-        .join(Track, Race.track_id == Track.id)
-        .join(TrackType, Track.track_type_id == TrackType.id)
-        .filter(TrackType.name == track_type_name)
-        .group_by(TrackType.name)
-        .first()
-    )
-
-    if not row:
+    # Check track type exists
+    tt = db.query(TrackType).filter(TrackType.name == track_type_name).first()
+    if not tt:
         raise HTTPException(status_code=404, detail=f"Track type '{track_type_name}' not found")
 
+    # Total races at this track type
+    total_races = (
+        db.query(func.count(Race.id))
+        .join(Track, Race.track_id == Track.id)
+        .filter(Track.track_type_id == tt.id)
+        .scalar()
+    )
+
+    # Base query — all results at this track type
+    base = (
+        db.query(Result)
+        .join(Race, Result.race_id == Race.id)
+        .join(Track, Race.track_id == Track.id)
+        .filter(Track.track_type_id == tt.id)
+    )
+
+    avg_winner_dk = (
+        db.query(func.avg(Result.dk_points))
+        .join(Race, Result.race_id == Race.id)
+        .join(Track, Race.track_id == Track.id)
+        .filter(Track.track_type_id == tt.id, Result.finish_position == 1)
+        .scalar()
+    )
+
+    max_dk = (
+        db.query(func.max(Result.dk_points))
+        .join(Race, Result.race_id == Race.id)
+        .join(Track, Race.track_id == Track.id)
+        .filter(Track.track_type_id == tt.id)
+        .scalar()
+    )
+
+    avg_winner_laps_led = (
+        db.query(func.avg(Result.laps_led))
+        .join(Race, Result.race_id == Race.id)
+        .join(Track, Race.track_id == Track.id)
+        .filter(Track.track_type_id == tt.id, Result.finish_position == 1)
+        .scalar()
+    )
+
+    avg_dominator_dk = (
+        db.query(func.avg(Result.dk_points))
+        .join(Race, Result.race_id == Race.id)
+        .join(Track, Race.track_id == Track.id)
+        .filter(Track.track_type_id == tt.id, Result.laps_led >= 50)
+        .scalar()
+    )
+
+    # Chalk win rate: winners who started top 5
+    total_winners = (
+        db.query(func.count(Result.id))
+        .join(Race, Result.race_id == Race.id)
+        .join(Track, Race.track_id == Track.id)
+        .filter(Track.track_type_id == tt.id, Result.finish_position == 1)
+        .scalar()
+    ) or 0
+
+    chalk_winners = (
+        db.query(func.count(Result.id))
+        .join(Race, Result.race_id == Race.id)
+        .join(Track, Race.track_id == Track.id)
+        .filter(
+            Track.track_type_id == tt.id,
+            Result.finish_position == 1,
+            Result.start_position <= 5
+        )
+        .scalar()
+    ) or 0
+
+    chalk_win_rate = round((chalk_winners / total_winners * 100), 1) if total_winners > 0 else None
+
     return {
-        "track_type":             row.track_type,
-        "total_races":            row.total_races,
-        "avg_winner_dk":          round(float(row.avg_winner_dk), 1) if row.avg_winner_dk else None,
-        "max_dk_ever":            round(float(row.max_dk_ever), 1) if row.max_dk_ever else None,
-        "avg_winner_laps_led":    round(float(row.avg_winner_laps_led), 0) if row.avg_winner_laps_led else None,
-        "avg_dominator_dk":       round(float(row.avg_dominator_dk), 1) if row.avg_dominator_dk else None,
-        "chalk_win_rate":         round(float(row.chalk_win_rate), 1) if row.chalk_win_rate else None,
+        "track_type":           track_type_name,
+        "total_races":          total_races,
+        "avg_winner_dk":        round(float(avg_winner_dk), 1) if avg_winner_dk else None,
+        "max_dk_ever":          round(float(max_dk), 1) if max_dk else None,
+        "avg_winner_laps_led":  round(float(avg_winner_laps_led), 0) if avg_winner_laps_led else None,
+        "avg_dominator_dk":     round(float(avg_dominator_dk), 1) if avg_dominator_dk else None,
+        "chalk_win_rate":       chalk_win_rate,
     }
