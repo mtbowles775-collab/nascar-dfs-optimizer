@@ -45,6 +45,7 @@ app.include_router(lineups.router,    prefix="/api/lineups",    tags=["Lineups"]
 app.include_router(ownership.router,  prefix="/api/ownership",  tags=["Ownership"])
 app.include_router(salaries.router,   prefix="/api/salaries",   tags=["Salaries"])
 app.include_router(admin.router,      prefix="/api/admin",      tags=["Admin"])
+app.include_router(track_types.router, prefix="/api/track-types", tags=["Track Types"])
 
 @app.get("/")
 def root():
