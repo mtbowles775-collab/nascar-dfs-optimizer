@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
-from routers import drivers, tracks, races, qualifying, practice, results, simulate, lineups, ownership, salaries, admin
+from routers import drivers, tracks, races, qualifying, practice, results, simulate, lineups, ownership, salaries, admin, track_types
 from database import engine, Base
 
 # Create all tables (safety net — schema.sql already did this)
