@@ -31,6 +31,35 @@ def get_current_race_id() -> int | None:
         db.close()
 
 
+async def run_live_feed_scrape():
+    """
+    Poll the NASCAR live feed for race results + loop data.
+    Called multiple times on race day — safe to call repeatedly (upserts).
+    Only processes data when run_type=3 (race) and race is in progress or complete.
+    """
+    db = SessionLocal()
+    try:
+        from scrapers.live_feed_scraper import scrape_live_feed
+        result = await scrape_live_feed(db)
+
+        if result.get("error"):
+            logger.warning(f"Live feed scraper: {result['error']}")
+        elif result.get("skipped"):
+            logger.info(f"Live feed scraper skipped: {result['reason']}")
+        else:
+            logger.info(
+                f"Live feed scraper: {result['race_name']} at {result['track_name']} "
+                f"({result['laps']}) — {result['results_saved']} results, "
+                f"{result['loop_data_saved']} loop data records"
+            )
+            if result.get("is_complete"):
+                logger.info("Race is COMPLETE — final results captured ✅")
+    except Exception as e:
+        logger.error(f"Live feed scraper failed: {e}", exc_info=True)
+    finally:
+        db.close()
+
+
 async def run_qualifying_scrape():
     """Fired Friday night + Saturday night at 11pm ET."""
     race_id = get_current_race_id()
@@ -49,37 +78,41 @@ async def run_qualifying_scrape():
         db.close()
 
 
-async def run_results_scrape():
-    """Fired Sunday evening at 8pm, 9pm, 10pm ET until results found."""
-    # Find the most recently completed or in-progress race
-    db = SessionLocal()
-    try:
-        today = date.today()
-        race = (
-            db.query(Race)
-            .filter(
-                Race.race_date <= today,
-                Race.status == "scheduled"  # not yet marked completed
-            )
-            .order_by(Race.race_date.desc())
-            .first()
-        )
-        if not race:
-            return
-        logger.info(f"Results scraper firing for race_id={race.id}")
-        from scrapers.results_scraper import scrape_results
-        count = await scrape_results(race.id, db)
-        logger.info(f"Results scraper: saved {count} results for race {race.id}")
-    except Exception as e:
-        logger.error(f"Results scraper failed: {e}")
-    finally:
-        db.close()
-
-
 def start_scheduler():
     """Call this once when the FastAPI app starts."""
 
-    # Qualifying: Friday 11pm ET + Saturday 11pm ET
+    # ── Race results via Live Feed ──
+    # Sunday: poll every 30 min from 2pm-midnight ET (covers all race windows)
+    # This catches races that end early or run late
+    for hour in range(14, 24):
+        for minute in [0, 30]:
+            scheduler.add_job(
+                run_live_feed_scrape,
+                CronTrigger(
+                    day_of_week="sun",
+                    hour=hour,
+                    minute=minute,
+                    timezone="America/New_York",
+                ),
+                id=f"live_feed_{hour}_{minute}",
+                replace_existing=True,
+            )
+
+    # Saturday races (road courses, some Xfinity/Trucks)
+    for hour in range(12, 20):
+        scheduler.add_job(
+            run_live_feed_scrape,
+            CronTrigger(
+                day_of_week="sat",
+                hour=hour,
+                minute=0,
+                timezone="America/New_York",
+            ),
+            id=f"live_feed_sat_{hour}",
+            replace_existing=True,
+        )
+
+    # ── Qualifying (keep existing schedule) ──
     scheduler.add_job(
         run_qualifying_scrape,
         CronTrigger(day_of_week="fri,sat", hour=23, minute=0, timezone="America/New_York"),
@@ -87,14 +120,9 @@ def start_scheduler():
         replace_existing=True,
     )
 
-    # Results: Sunday 8pm, 9pm, 10pm, 11pm ET (covers all race end times)
-    for hour in [20, 21, 22, 23]:
-        scheduler.add_job(
-            run_results_scrape,
-            CronTrigger(day_of_week="sun", hour=hour, minute=0, timezone="America/New_York"),
-            id=f"results_scraper_{hour}",
-            replace_existing=True,
-        )
-
     scheduler.start()
-    logger.info("Scheduler started — qualifying (Fri/Sat 11pm) + results (Sun 8-11pm)")
+    logger.info(
+        "Scheduler started — "
+        "live feed (Sat 12-7pm, Sun 2pm-midnight ET every 30min) + "
+        "qualifying (Fri/Sat 11pm)"
+    )
