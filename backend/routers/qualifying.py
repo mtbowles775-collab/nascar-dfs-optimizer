@@ -1,5 +1,5 @@
 # ============================================================
-# routers/qualifying.py
+# routers/qualifying.py — Qualifying positions + times
 # ============================================================
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
@@ -11,34 +11,40 @@ from datetime import datetime
 
 router = APIRouter()
 
+
 @router.get("/{race_id}", response_model=List[QualifyingOut])
 def get_qualifying(race_id: int, db: Session = Depends(get_db)):
+    """Get qualifying results — single query with JOINs."""
+    race = db.query(Race).filter(Race.id == race_id).first()
+    if not race:
+        raise HTTPException(status_code=404, detail="Race not found")
+
     rows = (
-        db.query(Qualifying)
+        db.query(Qualifying, Driver, DriverSeason)
+        .join(Driver, Qualifying.driver_id == Driver.id)
+        .outerjoin(
+            DriverSeason,
+            (DriverSeason.driver_id == Driver.id) &
+            (DriverSeason.season == race.season)
+        )
         .filter(Qualifying.race_id == race_id)
         .order_by(Qualifying.start_position)
         .all()
     )
-    result = []
-    for q in rows:
-        driver = db.query(Driver).filter(Driver.id == q.driver_id).first()
-        season_info = (
-            db.query(DriverSeason)
-            .filter(DriverSeason.driver_id == q.driver_id)
-            .order_by(DriverSeason.season.desc())
-            .first()
-        )
-        result.append(QualifyingOut(
+
+    return [
+        QualifyingOut(
             id              = q.id,
             driver_id       = q.driver_id,
-            driver_name     = driver.full_name if driver else None,
-            car_number      = season_info.car_number if season_info else None,
+            driver_name     = d.full_name,
+            car_number      = ds.car_number if ds else None,
             start_position  = q.start_position,
             lap_time_sec    = q.lap_time_sec,
             lap_speed_mph   = q.lap_speed_mph,
             source          = q.source,
-        ))
-    return result
+        )
+        for q, d, ds in rows
+    ]
 
 
 @router.post("/{race_id}")
@@ -52,7 +58,7 @@ def save_qualifying(race_id: int, body: QualifyingIn, db: Session = Depends(get_
     for driver_id, start_pos in body.positions.items():
         existing = db.query(Qualifying).filter(
             Qualifying.race_id == race_id,
-            Qualifying.driver_id == int(driver_id)
+            Qualifying.driver_id == int(driver_id),
         ).first()
 
         if existing:

@@ -12,21 +12,23 @@ from sqlalchemy.sql import func
 from database import Base
 
 
-# ── Users (Supabase Auth integration) ────────────────────
+# ── User (subscription / auth) ────────────────────────────
 class User(Base):
     __tablename__ = "users"
     id                  = Column(Integer, primary_key=True)
-    supabase_uid        = Column(String(36), unique=True, nullable=False, index=True)
+    supabase_uid        = Column(String(255), unique=True, nullable=False, index=True)
     email               = Column(String(255), unique=True, nullable=False)
     display_name        = Column(String(100))
-    tier                = Column(String(20), default="free")       # free | pro | admin
-    subscription_status = Column(String(20), default="inactive")   # inactive | active | cancelled | past_due
+    tier                = Column(String(20), default="free")         # free | pro | admin
+    subscription_status = Column(String(20), default="inactive")     # inactive | active | canceled | past_due
+    stripe_customer_id  = Column(String(255))
     is_admin            = Column(Boolean, default=False)
     created_at          = Column(DateTime, server_default=func.now())
     updated_at          = Column(DateTime, server_default=func.now(), onupdate=func.now())
     lineups             = relationship("Lineup", back_populates="user")
 
 
+# ── Track hierarchy ───────────────────────────────────────
 class TrackType(Base):
     __tablename__ = "track_types"
     id          = Column(Integer, primary_key=True)
@@ -52,6 +54,7 @@ class Track(Base):
     races           = relationship("Race", back_populates="track")
 
 
+# ── Teams & manufacturers ────────────────────────────────
 class Manufacturer(Base):
     __tablename__ = "manufacturers"
     id      = Column(Integer, primary_key=True)
@@ -71,6 +74,7 @@ class Team(Base):
     driver_seasons  = relationship("DriverSeason", back_populates="team")
 
 
+# ── Drivers ──────────────────────────────────────────────
 class Driver(Base):
     __tablename__ = "drivers"
     id              = Column(Integer, primary_key=True)
@@ -79,7 +83,6 @@ class Driver(Base):
     nationality     = Column(String(50), default="American")
     birth_date      = Column(Date)
     active          = Column(Boolean, default=True)
-    nascar_driver_id = Column(Integer, unique=True, index=True)    # NASCAR's own driver_id from live feed
     created_at      = Column(DateTime, server_default=func.now())
     seasons         = relationship("DriverSeason", back_populates="driver")
     results         = relationship("Result", back_populates="driver")
@@ -108,12 +111,13 @@ class DriverSeason(Base):
     manufacturer    = relationship("Manufacturer")
 
 
+# ── Races ────────────────────────────────────────────────
 class Race(Base):
     __tablename__ = "races"
     id              = Column(Integer, primary_key=True)
     season          = Column(Integer, nullable=False)
     race_number     = Column(Integer, nullable=False)
-    series          = Column(String(10), default="cup", nullable=False)  # cup | xfinity | trucks
+    series          = Column(String(20), default="cup", nullable=False)  # cup | xfinity | trucks
     track_id        = Column(Integer, ForeignKey("tracks.id"), nullable=False)
     race_name       = Column(String(150))
     race_date       = Column(Date)
@@ -123,11 +127,10 @@ class Race(Base):
     stage2_laps     = Column(Integer)
     stage3_laps     = Column(Integer)
     total_miles     = Column(Numeric(7, 2))
-    caution_segments = Column(Integer)          # from live feed
-    caution_laps     = Column(Integer)          # from live feed
-    lead_changes     = Column(Integer)          # from live feed
-    number_of_leaders = Column(Integer)         # from live feed
-    nascar_race_id   = Column(Integer, index=True)  # NASCAR's own race_id from live feed
+    caution_count   = Column(Integer)                               # NEW: for caution modeling
+    caution_laps    = Column(Integer)                               # NEW: for caution modeling
+    lead_changes    = Column(Integer)                               # NEW: dominator analysis
+    leaders_count   = Column(Integer)                               # NEW: dominator analysis
     status          = Column(String(20), default="scheduled")
     notes           = Column(Text)
     created_at      = Column(DateTime, server_default=func.now())
@@ -140,6 +143,7 @@ class Race(Base):
     simulations     = relationship("Simulation", back_populates="race")
 
 
+# ── Qualifying ───────────────────────────────────────────
 class Qualifying(Base):
     __tablename__ = "qualifying"
     id              = Column(Integer, primary_key=True)
@@ -156,6 +160,7 @@ class Qualifying(Base):
     driver          = relationship("Driver", back_populates="qualifying")
 
 
+# ── Practice ─────────────────────────────────────────────
 class Practice(Base):
     __tablename__ = "practice"
     id              = Column(Integer, primary_key=True)
@@ -175,6 +180,7 @@ class Practice(Base):
     driver          = relationship("Driver", back_populates="practice")
 
 
+# ── Results ──────────────────────────────────────────────
 class Result(Base):
     __tablename__ = "results"
     id                  = Column(Integer, primary_key=True)
@@ -190,7 +196,6 @@ class Result(Base):
     fastest_lap_speed   = Column(Numeric(7, 3))
     green_flag_laps     = Column(Integer)
     green_flag_speed    = Column(Numeric(7, 3))
-    driver_rating       = Column(Numeric(6, 2))        # from driveraverages.com or computed
     dk_salary           = Column(Integer)
     dk_points           = Column(Numeric(6, 2))
     dk_place_pts        = Column(Numeric(6, 2))
@@ -205,12 +210,14 @@ class Result(Base):
     fd_laps_led_pts     = Column(Numeric(6, 2))
     fd_fast_lap_pts     = Column(Numeric(6, 2))
     fd_place_diff_pts   = Column(Numeric(6, 2))
+    fd_laps_complete_pts= Column(Numeric(6, 2))
     created_at          = Column(DateTime, server_default=func.now())
     __table_args__      = (UniqueConstraint("race_id", "driver_id"),)
     race                = relationship("Race", back_populates="results")
     driver              = relationship("Driver", back_populates="results")
 
 
+# ── Loop Data ────────────────────────────────────────────
 class LoopData(Base):
     __tablename__ = "loop_data"
     id                      = Column(Integer, primary_key=True)
@@ -224,16 +231,17 @@ class LoopData(Base):
     laps_in_top10           = Column(Integer, default=0)
     laps_in_top5            = Column(Integer, default=0)
     pct_laps_in_top15       = Column(Numeric(5, 2))
+    fastest_laps            = Column(Integer, default=0)
     fastest_lap_pct         = Column(Numeric(5, 2))
     avg_running_position    = Column(Numeric(5, 2))
     driver_rating           = Column(Numeric(6, 2))
-    passing_differential    = Column(Integer, default=0)          # from live feed
-    avg_speed               = Column(Numeric(7, 3))               # from live feed
-    avg_restart_speed       = Column(Numeric(7, 3))               # from live feed
-    best_lap_speed          = Column(Numeric(7, 3))               # from live feed
-    laps_position_improved  = Column(Integer, default=0)          # from live feed
+    passing_differential    = Column(Integer, default=0)            # NEW: from live feed
+    avg_speed               = Column(Numeric(7, 3))                 # NEW: from live feed
+    avg_restart_speed       = Column(Numeric(7, 3))                 # NEW: from live feed
+    best_lap_speed          = Column(Numeric(7, 3))                 # NEW: from live feed
     stage1_points           = Column(Integer, default=0)
     stage2_points           = Column(Integer, default=0)
+    stage3_points           = Column(Integer, default=0)            # NEW: 3rd stage
     stage_points_total      = Column(Integer, default=0)
     created_at              = Column(DateTime, server_default=func.now())
     __table_args__          = (UniqueConstraint("race_id", "driver_id"),)
@@ -241,6 +249,7 @@ class LoopData(Base):
     driver                  = relationship("Driver", back_populates="loop_data")
 
 
+# ── Ownership ────────────────────────────────────────────
 class Ownership(Base):
     __tablename__ = "ownership"
     id              = Column(Integer, primary_key=True)
@@ -257,6 +266,7 @@ class Ownership(Base):
     driver          = relationship("Driver", back_populates="ownership")
 
 
+# ── Salaries ─────────────────────────────────────────────
 class Salary(Base):
     __tablename__ = "salaries"
     id              = Column(Integer, primary_key=True)
@@ -272,6 +282,7 @@ class Salary(Base):
     driver          = relationship("Driver", back_populates="salaries")
 
 
+# ── Simulations ──────────────────────────────────────────
 class Simulation(Base):
     __tablename__ = "simulations"
     id              = Column(Integer, primary_key=True)
@@ -309,11 +320,12 @@ class SimulationDriverResult(Base):
     driver          = relationship("Driver")
 
 
+# ── Lineups (user-scoped) ────────────────────────────────
 class Lineup(Base):
     __tablename__ = "lineups"
     id              = Column(Integer, primary_key=True)
+    user_id         = Column(Integer, ForeignKey("users.id"), nullable=True)  # nullable for migration
     race_id         = Column(Integer, ForeignKey("races.id"), nullable=False)
-    user_id         = Column(Integer, ForeignKey("users.id"), nullable=True)   # nullable until auth enforced
     platform        = Column(String(20), default="draftkings")
     label           = Column(String(100))
     total_salary    = Column(Integer)

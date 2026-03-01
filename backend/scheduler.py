@@ -1,6 +1,6 @@
 # ============================================================
 # scheduler.py
-# APScheduler — fires scrapers automatically
+# APScheduler — fires scrapers automatically on race weekends
 # Runs inside the FastAPI process on Railway
 # ============================================================
 
@@ -34,7 +34,8 @@ def get_current_race_id() -> int | None:
 async def run_live_feed_scrape():
     """
     Poll the NASCAR live feed for race results + loop data.
-    Safe to call any time — if no race is happening, it skips instantly.
+    Called multiple times on race day — safe to call repeatedly (upserts).
+    Only processes data when run_type=3 (race) and race is in progress or complete.
     """
     db = SessionLocal()
     try:
@@ -44,7 +45,7 @@ async def run_live_feed_scrape():
         if result.get("error"):
             logger.warning(f"Live feed scraper: {result['error']}")
         elif result.get("skipped"):
-            logger.debug(f"Live feed scraper skipped: {result['reason']}")
+            logger.info(f"Live feed scraper skipped: {result['reason']}")
         else:
             logger.info(
                 f"Live feed scraper: {result['race_name']} at {result['track_name']} "
@@ -80,14 +81,15 @@ async def run_qualifying_scrape():
 def start_scheduler():
     """Call this once when the FastAPI app starts."""
 
-    # ── Live Feed: every day, every 30 min from 12pm-midnight ET ──
-    # Covers all race windows: Fri night, Sat, Sun, Mon rain delays
-    # If no race is happening, the scraper skips instantly (near-zero cost)
-    for hour in range(12, 24):
+    # ── Race results via Live Feed ──
+    # Sunday: poll every 30 min from 2pm-midnight ET (covers all race windows)
+    # This catches races that end early or run late
+    for hour in range(14, 24):
         for minute in [0, 30]:
             scheduler.add_job(
                 run_live_feed_scrape,
                 CronTrigger(
+                    day_of_week="sun",
                     hour=hour,
                     minute=minute,
                     timezone="America/New_York",
@@ -96,7 +98,21 @@ def start_scheduler():
                 replace_existing=True,
             )
 
-    # ── Qualifying: Fri + Sat 11pm ET ──
+    # Saturday races (road courses, some Xfinity/Trucks)
+    for hour in range(12, 20):
+        scheduler.add_job(
+            run_live_feed_scrape,
+            CronTrigger(
+                day_of_week="sat",
+                hour=hour,
+                minute=0,
+                timezone="America/New_York",
+            ),
+            id=f"live_feed_sat_{hour}",
+            replace_existing=True,
+        )
+
+    # ── Qualifying (keep existing schedule) ──
     scheduler.add_job(
         run_qualifying_scrape,
         CronTrigger(day_of_week="fri,sat", hour=23, minute=0, timezone="America/New_York"),
@@ -107,6 +123,6 @@ def start_scheduler():
     scheduler.start()
     logger.info(
         "Scheduler started — "
-        "live feed (daily 12pm-midnight ET every 30min) + "
-        "qualifying (Fri/Sat 11pm ET)"
+        "live feed (Sat 12-7pm, Sun 2pm-midnight ET every 30min) + "
+        "qualifying (Fri/Sat 11pm)"
     )
