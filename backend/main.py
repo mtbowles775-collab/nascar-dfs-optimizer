@@ -47,6 +47,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "http://localhost:5173",
+        "https://turn-four.vercel.app",
         # TODO: Add your Turn Four production domain here:
         # "https://turnfour.com",
         # "https://www.turnfour.com",
