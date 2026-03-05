@@ -14,27 +14,33 @@ router = APIRouter()
 @router.get("/{race_id}")
 def get_salaries(race_id: int, platform: str = "draftkings", db: Session = Depends(get_db)):
     rows = (
-        db.query(Salary, Driver, DriverSeason)
+        db.query(Salary, Driver)
         .join(Driver, Salary.driver_id == Driver.id)
-        .outerjoin(
-            DriverSeason,
-            (DriverSeason.driver_id == Driver.id)
-        )
         .filter(Salary.race_id == race_id, Salary.platform == platform)
         .order_by(Salary.salary.desc())
-        .distinct(Salary.id)   # avoid duplicates from multiple seasons
         .all()
     )
 
-    seen = set()
+    # Get current season car numbers separately to avoid duplicate rows
+    from models import Race
+    race = db.query(Race).filter(Race.id == race_id).first()
+    season = race.season if race else 2026
+
+    driver_seasons = {}
+    if rows:
+        driver_ids = [d.id for _, d in rows]
+        ds_rows = db.query(DriverSeason).filter(
+            DriverSeason.driver_id.in_(driver_ids),
+            DriverSeason.season == season,
+        ).all()
+        driver_seasons = {ds.driver_id: ds for ds in ds_rows}
+
     out = []
-    for s, d, ds in rows:
-        if s.id in seen:
-            continue
-        seen.add(s.id)
+    for s, d in rows:
+        ds = driver_seasons.get(d.id)
         out.append({
             "driver_id":     s.driver_id,
-            "driver_name":   d.full_name,
+            "driver_name":   f"{d.first_name} {d.last_name}",
             "car_number":    ds.car_number if ds else None,
             "platform":      s.platform,
             "salary":        s.salary,
