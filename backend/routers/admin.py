@@ -1,166 +1,120 @@
 # ============================================================
-# routers/admin.py — Scraper triggers + bulk operations
+# routers/admin.py — Admin endpoints for data management
+# Trigger scrapers, manage data, health checks
 # ============================================================
-import json
-from fastapi import APIRouter, Depends, HTTPException, Request
+
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from database import get_db
-from models import Race, Result, Qualifying, Salary, LoopData, Driver
+from models import Race, Result, LoopData, Qualifying
+from datetime import date
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
 
-@router.post("/scrape/qualifying/{race_id}")
-async def trigger_qual_scrape(race_id: int, db: Session = Depends(get_db)):
-    """Manually trigger a qualifying scrape for a specific race."""
-    from scrapers.qualifying_scraper import scrape_qualifying
-    try:
-        result = await scrape_qualifying(race_id, db)
-        return {"status": "success", "scraped": result}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/scrape/results/{race_id}")
-async def trigger_results_scrape(race_id: int, db: Session = Depends(get_db)):
-    """Manually trigger a results scrape + DK/FD point calculation."""
-    from scrapers.results_scraper import scrape_results
-    try:
-        result = await scrape_results(race_id, db)
-        return {"status": "success", "scraped": result}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 @router.post("/scrape/live-feed")
-async def trigger_live_feed_scrape(db: Session = Depends(get_db)):
-    """Manually trigger a live feed scrape for the current race."""
+async def trigger_live_feed(db: Session = Depends(get_db)):
+    """
+    Manually trigger the live feed scraper.
+    Safe to call multiple times — upserts all data.
+    Returns summary of what was scraped.
+    """
     from scrapers.live_feed_scraper import scrape_live_feed
-    try:
-        result = await scrape_live_feed(db)
-        return {"status": "success", "result": result}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    result = await scrape_live_feed(db)
+    return result
 
 
-@router.post("/import/loop-data-file")
-async def import_loop_data_file(request: Request, db: Session = Depends(get_db)):
-    """
-    Import loop data from Racing-Reference JSON upload.
-    curl -X POST -H "Content-Type: application/json" -d @racing_reference_loop_data.json URL
-    """
-    body = await request.body()
-    races_data = json.loads(body)
+@router.post("/scrape/qualifying/{race_id}")
+async def trigger_qualifying(race_id: int, db: Session = Depends(get_db)):
+    """Manually trigger qualifying scraper for a specific race."""
+    race = db.query(Race).filter(Race.id == race_id).first()
+    if not race:
+        raise HTTPException(status_code=404, detail=f"Race {race_id} not found")
 
-    imported = 0
-    skipped = 0
-    no_race = 0
-    no_driver = 0
+    from scrapers.qualifying_scraper import scrape_qualifying
+    count = await scrape_qualifying(race_id, db)
+    return {"race_id": race_id, "qualifying_saved": count}
 
-    for race_entry in races_data:
-        year = race_entry["year"]
-        race_num = race_entry["race_number"]
 
-        # Find matching race
-        race = (
-            db.query(Race)
-            .filter(Race.season == year, Race.race_number == race_num, Race.series == "cup")
-            .first()
-        )
-        if not race:
-            no_race += len(race_entry["drivers"])
-            continue
+@router.get("/data-status")
+def data_status(db: Session = Depends(get_db)):
+    """Overview of data completeness — useful for monitoring."""
+    from sqlalchemy import func
+    from models import Driver, Track, Salary, Simulation
 
-        # Update race metadata if missing
-        if race_entry.get("cautions") and not race.caution_segments:
-            race.caution_segments = race_entry["cautions"]
-        if race_entry.get("caution_laps") and not race.caution_laps:
-            race.caution_laps = race_entry["caution_laps"]
-        if race_entry.get("lead_changes") and not race.lead_changes:
-            race.lead_changes = race_entry["lead_changes"]
+    total_drivers   = db.query(func.count(Driver.id)).scalar()
+    active_drivers  = db.query(func.count(Driver.id)).filter(Driver.active == True).scalar()
+    total_tracks    = db.query(func.count(Track.id)).scalar()
+    total_races     = db.query(func.count(Race.id)).scalar()
+    total_results   = db.query(func.count(Result.id)).scalar()
+    total_loop      = db.query(func.count(LoopData.id)).scalar()
+    total_qual      = db.query(func.count(Qualifying.id)).scalar()
+    total_salaries  = db.query(func.count(Salary.id)).scalar()
+    total_sims      = db.query(func.count(Simulation.id)).scalar()
 
-        for d in race_entry["drivers"]:
-            driver_name = d["driver"]
-            parts = driver_name.split(" ", 1)
-            first = parts[0]
-            last = parts[1] if len(parts) > 1 else ""
-
-            # Find driver — try exact match, then fuzzy
-            driver = (
-                db.query(Driver)
-                .filter(Driver.first_name == first, Driver.last_name == last)
-                .first()
-            )
-            if not driver:
-                # Try case-insensitive
-                driver = (
-                    db.query(Driver)
-                    .filter(
-                        Driver.first_name.ilike(first),
-                        Driver.last_name.ilike(last),
-                    )
-                    .first()
-                )
-            if not driver:
-                no_driver += 1
-                continue
-
-            # Check if loop_data already exists
-            existing = (
-                db.query(LoopData)
-                .filter(LoopData.race_id == race.id, LoopData.driver_id == driver.id)
-                .first()
-            )
-            if existing:
-                skipped += 1
-                continue
-
-            total_laps = d.get("total_laps", 1) or 1
-            loop = LoopData(
-                race_id=race.id,
-                driver_id=driver.id,
-                green_flag_passes=d["green_flag_passes"],
-                green_flag_passed=d["green_flag_times_passed"],
-                quality_passes=d["quality_passes"],
-                avg_running_position=d["avg_pos"],
-                passing_differential=d["pass_diff"],
-                laps_in_top15=d["top15_laps"],
-                pct_laps_in_top15=d["pct_top15_laps"],
-                fastest_lap_pct=round(d["fastest_laps"] / total_laps * 100, 2) if total_laps else 0,
-                driver_rating=d["driver_rating"],
-            )
-            db.add(loop)
-
-            # Also backfill driver_rating on results table
-            result = (
-                db.query(Result)
-                .filter(Result.race_id == race.id, Result.driver_id == driver.id)
-                .first()
-            )
-            if result and not result.driver_rating:
-                result.driver_rating = d["driver_rating"]
-
-            imported += 1
-
-    db.commit()
+    # Current season stats
+    current_year = date.today().year
+    season_races = db.query(func.count(Race.id)).filter(Race.season == current_year).scalar()
+    completed    = db.query(func.count(Race.id)).filter(
+        Race.season == current_year, Race.status == "completed"
+    ).scalar()
+    scheduled    = db.query(func.count(Race.id)).filter(
+        Race.season == current_year, Race.status == "scheduled"
+    ).scalar()
 
     return {
-        "status": "success",
-        "imported": imported,
-        "skipped_existing": skipped,
-        "no_race_match": no_race,
-        "no_driver_match": no_driver,
-        "total_loop_data": db.query(LoopData).count(),
+        "totals": {
+            "drivers":      total_drivers,
+            "active_drivers": active_drivers,
+            "tracks":       total_tracks,
+            "races":        total_races,
+            "results":      total_results,
+            "loop_data":    total_loop,
+            "qualifying":   total_qual,
+            "salaries":     total_salaries,
+            "simulations":  total_sims,
+        },
+        "current_season": {
+            "year":         current_year,
+            "total_races":  season_races,
+            "completed":    completed,
+            "scheduled":    scheduled,
+        },
     }
 
 
-@router.get("/stats")
-def admin_stats(db: Session = Depends(get_db)):
-    """Quick health check on data completeness."""
+@router.get("/next-race")
+def next_race_info(db: Session = Depends(get_db)):
+    """Quick check: what's the next race and is data ready?"""
+    from models import Salary
+    from sqlalchemy import func
+
+    race = (
+        db.query(Race)
+        .filter(Race.race_date >= date.today(), Race.status == "scheduled")
+        .order_by(Race.race_date)
+        .first()
+    )
+    if not race:
+        return {"message": "No upcoming races found"}
+
+    qual_count = db.query(func.count(Qualifying.id)).filter(
+        Qualifying.race_id == race.id
+    ).scalar()
+
+    salary_count = db.query(func.count(Salary.id)).filter(
+        Salary.race_id == race.id
+    ).scalar()
+
     return {
-        "races":        db.query(Race).count(),
-        "results":      db.query(Result).count(),
-        "qualifying":   db.query(Qualifying).count(),
-        "salaries":     db.query(Salary).count(),
-        "loop_data":    db.query(LoopData).count(),
+        "race_id":      race.id,
+        "race_name":    race.race_name,
+        "race_date":    str(race.race_date),
+        "race_number":  race.race_number,
+        "qualifying":   qual_count,
+        "salaries":     salary_count,
+        "ready":        qual_count > 0 and salary_count > 0,
     }

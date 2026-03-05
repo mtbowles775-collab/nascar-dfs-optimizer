@@ -2,6 +2,9 @@
 # scrapers/live_feed_scraper.py
 # Pulls race results + loop data from NASCAR live feed
 # Source: cf.nascar.com/live/feeds/
+#
+# FIXED: Now imports scoring from scoring.py (single source of truth)
+# instead of maintaining duplicate scoring constants.
 # ============================================================
 
 import httpx
@@ -19,24 +22,6 @@ PIT_DATA_URL = "https://cf.nascar.com/live/feeds/live-pit-data.json"
 # NASCAR series_id → our series string
 SERIES_MAP = {1: "cup", 2: "xfinity", 3: "trucks"}
 
-# DraftKings place points (Cup — same for all series on DK)
-DK_PLACE_PTS = {
-    1: 46, 2: 42, 3: 41, 4: 40, 5: 39, 6: 38, 7: 37, 8: 36,
-    9: 35, 10: 34, 11: 32, 12: 30, 13: 28, 14: 26, 15: 24,
-    16: 22, 17: 20, 18: 19, 19: 18, 20: 17, 21: 16, 22: 15,
-    23: 14, 24: 13, 25: 12, 26: 11, 27: 10, 28: 9, 29: 8,
-    30: 7, 31: 6, 32: 5, 33: 4, 34: 3, 35: 2, 36: 1,
-}
-
-# FanDuel place points
-FD_PLACE_PTS = {
-    1: 43, 2: 40, 3: 38, 4: 36, 5: 35, 6: 34, 7: 33, 8: 32,
-    9: 31, 10: 30, 11: 28, 12: 26, 13: 24, 14: 22, 15: 20,
-    16: 18, 17: 16, 18: 15, 19: 14, 20: 13, 21: 12, 22: 11,
-    23: 10, 24: 9, 25: 8, 26: 7, 27: 6, 28: 5, 29: 4,
-    30: 3, 31: 2, 32: 1,
-}
-
 
 def calculate_dk_points(
     finish: int,
@@ -46,36 +31,32 @@ def calculate_dk_points(
     laps_completed: int,
     total_laps: int,
 ) -> dict:
-    """Calculate DraftKings fantasy points from raw race data."""
-    place_pts = DK_PLACE_PTS.get(finish, 0)
+    """
+    Calculate DraftKings fantasy points from raw race data.
+    Uses scoring.py as the single source of truth for point values.
+    """
+    from scoring import calc_dk_points
 
-    # Position differential: +0.5 per pos gained, -0.25 per pos lost
-    pos_diff = start - finish
-    place_diff_pts = pos_diff * 0.5 if pos_diff > 0 else pos_diff * 0.25
+    # The live feed gives us is_fastest_lap as a boolean, but scoring.py
+    # expects fastest_laps as a count. Convert: True → 1 fastest lap.
+    fastest_laps = 1 if is_fastest_lap else 0
 
-    # Laps led: 0.25 per lap
-    laps_led_pts = laps_led * 0.25
+    result = calc_dk_points(
+        finish_position=finish,
+        start_position=start,
+        laps_led=laps_led,
+        fastest_laps=fastest_laps,
+    )
 
-    # Fastest lap bonus
-    fast_lap_pts = 5.0 if is_fastest_lap else 0.0
+    # Add laps_complete_pts (not in base scoring.py — completion bonus)
+    # DK awards 0 for laps completed in standard Classic format
+    result["dk_laps_complete_pts"] = 0.0
 
-    # Completion bonus (finished ≥ race distance)
-    laps_complete_pts = 4.0 if laps_completed >= total_laps else 0.0
+    # Add dominator bonus (not in base scoring.py)
+    # DK does NOT have a dominator bonus in Classic format
+    result["dk_dominator_bonus"] = 0.0
 
-    # Dominator bonus (led ≥ 50 laps)
-    dominator_bonus = 10.0 if laps_led >= 50 else 0.0
-
-    total = place_pts + place_diff_pts + laps_led_pts + fast_lap_pts + laps_complete_pts + dominator_bonus
-
-    return {
-        "dk_place_pts":         round(place_pts, 2),
-        "dk_place_diff_pts":    round(place_diff_pts, 2),
-        "dk_laps_led_pts":      round(laps_led_pts, 2),
-        "dk_fast_lap_pts":      round(fast_lap_pts, 2),
-        "dk_laps_complete_pts": round(laps_complete_pts, 2),
-        "dk_dominator_bonus":   round(dominator_bonus, 2),
-        "dk_points":            round(total, 2),
-    }
+    return result
 
 
 def calculate_fd_points(
@@ -86,28 +67,23 @@ def calculate_fd_points(
     laps_completed: int,
     total_laps: int,
 ) -> dict:
-    """Calculate FanDuel fantasy points from raw race data."""
-    place_pts = FD_PLACE_PTS.get(finish, 0)
+    """
+    Calculate FanDuel fantasy points from raw race data.
+    Uses scoring.py as the single source of truth for point values.
+    """
+    from scoring import calc_fd_points
 
-    # FD: +1 per pos gained, -0.5 per pos lost
-    pos_diff = start - finish
-    place_diff_pts = pos_diff * 1.0 if pos_diff > 0 else pos_diff * 0.5
+    result = calc_fd_points(
+        finish_position=finish,
+        start_position=start,
+        laps_completed=laps_completed,
+        laps_led=laps_led,
+    )
 
-    # Laps led: 0.1 per lap
-    laps_led_pts = laps_led * 0.1
+    # FD does not have a separate fastest lap bonus in standard scoring
+    result["fd_fast_lap_pts"] = 0.0
 
-    # Fastest lap bonus
-    fast_lap_pts = 3.0 if is_fastest_lap else 0.0
-
-    total = place_pts + place_diff_pts + laps_led_pts + fast_lap_pts
-
-    return {
-        "fd_place_pts":      round(place_pts, 2),
-        "fd_place_diff_pts": round(place_diff_pts, 2),
-        "fd_laps_led_pts":   round(laps_led_pts, 2),
-        "fd_fast_lap_pts":   round(fast_lap_pts, 2),
-        "fd_points":         round(total, 2),
-    }
+    return result
 
 
 def _get_or_create_driver(db: Session, vehicle: dict) -> int:
@@ -265,7 +241,6 @@ async def scrape_live_feed(db: Session) -> dict:
                 for stage in stage_resp.json():
                     stage_num = stage.get("stage_number")
                     race_id_check = stage.get("race_id")
-                    # Only use stage points if they match our race
                     if race_id_check != feed["race_id"]:
                         continue
                     for r in stage.get("results", []):
@@ -301,7 +276,7 @@ async def scrape_live_feed(db: Session) -> dict:
 
             is_fastest = (nascar_did == fastest_driver_id)
 
-            # ── DK + FD Fantasy Points ──
+            # ── DK + FD Fantasy Points (using scoring.py via wrappers) ──
             dk = calculate_dk_points(finish, start, laps_led, is_fastest, laps_completed, total_laps)
             fd = calculate_fd_points(finish, start, laps_led, is_fastest, laps_completed, total_laps)
 

@@ -2,6 +2,10 @@
 # simulation_engine.py
 # Monte Carlo simulation engine for NASCAR DFS
 # Called by the /api/simulate router
+#
+# FIXED: Now imports scoring from scoring.py (single source of truth)
+# instead of maintaining duplicate scoring constants that were
+# on a completely different scale (1st = 100 instead of 45).
 # ============================================================
 
 import random
@@ -12,42 +16,47 @@ from sqlalchemy.orm import Session
 from models import Driver, Race, Result, Qualifying, Salary, LoopData, DriverSeason
 from sqlalchemy import func, and_
 
-
-# ── DraftKings Scoring ────────────────────────────────────
-DK_PLACE_PTS = [
-    100, 88, 78, 72, 68, 64, 60, 56, 52, 48,
-    44,  40, 38, 36, 34, 32, 30, 28, 26, 24,
-    22,  20, 18, 16, 14, 12, 10,  8,  6,  4, 2
-]
-
-FD_PLACE_PTS = [
-    100, 90, 83, 78, 74, 70, 67, 64, 61, 58,
-    55,  52, 49, 46, 43, 40, 38, 36, 34, 32,
-    30,  28, 26, 24, 22, 20, 18, 16, 14, 12, 10
-]
+# ── Import canonical scoring from scoring.py ──────────────
+from scoring import calc_dk_points as _calc_dk, calc_fd_points as _calc_fd
 
 
 def calc_dk_points(finish_pos, start_pos, laps_led, fastest_lap, total_laps, laps_completed):
-    place_pts   = DK_PLACE_PTS[min(finish_pos - 1, len(DK_PLACE_PTS) - 1)]
-    diff_pts    = max(0, (start_pos - finish_pos) * 1.0) if start_pos else 0
-    led_pts     = laps_led * 0.25
-    fl_pts      = 5.0 if fastest_lap else 0.0
-    comp_pts    = 4.0 if total_laps > 0 and laps_completed / total_laps >= 0.75 else 0.0
-    dom_bonus   = 10.0 if laps_led >= 50 else 0.0
-    total       = place_pts + diff_pts + led_pts + fl_pts + comp_pts + dom_bonus
+    """
+    Wrapper around scoring.py's calc_dk_points for sim engine use.
+    Adapts the boolean fastest_lap to a count, and returns a dict
+    with 'total' key for backward compatibility with results_scraper.
+    """
+    fastest_laps = 1 if fastest_lap else 0
+    result = _calc_dk(
+        finish_position=finish_pos,
+        start_position=start_pos,
+        laps_led=laps_led,
+        fastest_laps=fastest_laps,
+    )
+    # Map to the dict format expected by results_scraper.py
     return {
-        "total": total, "place": place_pts, "diff": diff_pts,
-        "led": led_pts, "fl": fl_pts, "comp": comp_pts, "dom": dom_bonus
+        "total": result["dk_points"],
+        "place": result["dk_place_pts"],
+        "diff":  result["dk_place_diff_pts"],
+        "led":   result["dk_laps_led_pts"],
+        "fl":    result["dk_fast_lap_pts"],
+        "comp":  0.0,
+        "dom":   0.0,
     }
 
 
 def calc_fd_points(finish_pos, start_pos, laps_led, fastest_lap, total_laps, laps_completed):
-    place_pts   = FD_PLACE_PTS[min(finish_pos - 1, len(FD_PLACE_PTS) - 1)]
-    diff_pts    = max(0, (start_pos - finish_pos) * 1.0) if start_pos else 0
-    led_pts     = laps_led * 0.5
-    fl_pts      = 10.0 if fastest_lap else 0.0
-    total       = place_pts + diff_pts + led_pts + fl_pts
-    return total
+    """
+    Wrapper around scoring.py's calc_fd_points for sim engine use.
+    Returns a single float for backward compatibility.
+    """
+    result = _calc_fd(
+        finish_position=finish_pos,
+        start_position=start_pos,
+        laps_completed=laps_completed,
+        laps_led=laps_led,
+    )
+    return result["fd_points"]
 
 
 def gaussian(mean: float, std: float) -> float:
@@ -391,7 +400,6 @@ def optimize_lineups(sim_results: List[Dict], salary_cap: int, n_lineups: int,
             if driver["salary"] > budget:
                 continue
             if min_salary and (budget - driver["salary"]) > (salary_cap * 0.15):
-                # Don't leave more than 15% of cap unused if min_salary enforced
                 pass
             lineup.append(driver)
             budget -= driver["salary"]
