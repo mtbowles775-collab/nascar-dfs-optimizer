@@ -2,13 +2,15 @@
 # scrapers/results_scraper.py
 # Scrapes race results + calculates DK/FD fantasy points
 # Triggered automatically after race ends on Sunday
+#
+# Imports scoring directly from scoring.py (single source of truth)
 # ============================================================
 
 import httpx
 from datetime import datetime
 from sqlalchemy.orm import Session
 from models import Race, Driver, DriverSeason, Result, Qualifying
-from simulation_engine import calc_dk_points, calc_fd_points
+from scoring import calc_dk_points, calc_fd_points
 
 
 async def scrape_results(race_id: int, db: Session) -> int:
@@ -27,12 +29,12 @@ async def scrape_results(race_id: int, db: Session) -> int:
         resp.raise_for_status()
         data = resp.json()
 
-    entries     = data.get("data", {}).get("entries", [])
-    total_laps  = data.get("data", {}).get("laps_in_race", race.scheduled_laps)
+    entries    = data.get("data", {}).get("entries", [])
+    total_laps = data.get("data", {}).get("laps_in_race", race.scheduled_laps)
 
     # Update race with actual laps
-    race.actual_laps    = total_laps
-    race.status         = "completed"
+    race.actual_laps = total_laps
+    race.status      = "completed"
 
     # Build qualifying start position map
     qual_map = {
@@ -42,13 +44,13 @@ async def scrape_results(race_id: int, db: Session) -> int:
 
     saved = 0
     for entry in entries:
-        car_number      = str(entry.get("car_number", ""))
-        finish_pos      = int(entry.get("finish_position", 0))
-        laps_completed  = int(entry.get("laps_completed", 0))
-        laps_led        = int(entry.get("laps_led", 0))
-        fastest_lap     = bool(entry.get("fastest_laps_run", 0))
-        status          = entry.get("status", "running").lower()
-        green_fl_speed  = entry.get("average_speed")
+        car_number     = str(entry.get("car_number", ""))
+        finish_pos     = int(entry.get("finish_position", 0))
+        laps_completed = int(entry.get("laps_completed", 0))
+        laps_led       = int(entry.get("laps_led", 0))
+        fastest_laps   = int(entry.get("fastest_laps_run", 0))  # count, not boolean
+        status         = entry.get("status", "running").lower()
+        green_fl_speed = entry.get("average_speed")
 
         if finish_pos == 0:
             continue
@@ -61,17 +63,23 @@ async def scrape_results(race_id: int, db: Session) -> int:
         if not season_info:
             continue
 
-        driver_id   = season_info.driver_id
-        start_pos   = qual_map.get(driver_id, finish_pos)
+        driver_id = season_info.driver_id
+        start_pos = qual_map.get(driver_id, finish_pos)
 
-        # Calculate DK points broken out by component
+        # Calculate DK points — scoring.py is the single source of truth
         dk = calc_dk_points(
-            finish_pos, start_pos, laps_led, fastest_lap, total_laps, laps_completed
+            finish_position=finish_pos,
+            start_position=start_pos,
+            laps_led=laps_led,
+            fastest_laps=fastest_laps,
         )
 
-        # Calculate FD total
-        fd_total = calc_fd_points(
-            finish_pos, start_pos, laps_led, fastest_lap, total_laps, laps_completed
+        # Calculate FD points
+        fd = calc_fd_points(
+            finish_position=finish_pos,
+            start_position=start_pos,
+            laps_completed=laps_completed,
+            laps_led=laps_led,
         )
 
         existing = db.query(Result).filter(
@@ -79,21 +87,26 @@ async def scrape_results(race_id: int, db: Session) -> int:
         ).first()
 
         values = dict(
-            finish_position     = finish_pos,
-            start_position      = start_pos,
-            laps_completed      = laps_completed,
-            laps_led            = laps_led,
-            fastest_lap         = fastest_lap,
-            green_flag_speed    = float(green_fl_speed) if green_fl_speed else None,
-            status              = status,
-            dk_points           = dk["total"],
-            dk_place_pts        = dk["place"],
-            dk_place_diff_pts   = dk["diff"],
-            dk_laps_led_pts     = dk["led"],
-            dk_fast_lap_pts     = dk["fl"],
-            dk_laps_complete_pts= dk["comp"],
-            dk_dominator_bonus  = dk["dom"],
-            fd_points           = fd_total,
+            finish_position      = finish_pos,
+            start_position       = start_pos,
+            laps_completed       = laps_completed,
+            laps_led             = laps_led,
+            fastest_lap          = fastest_laps > 0,   # boolean for display
+            green_flag_speed     = float(green_fl_speed) if green_fl_speed else None,
+            status               = status,
+            dk_points            = dk["dk_points"],
+            dk_place_pts         = dk["dk_place_pts"],
+            dk_place_diff_pts    = dk["dk_place_diff_pts"],
+            dk_laps_led_pts      = dk["dk_laps_led_pts"],
+            dk_fast_lap_pts      = dk["dk_fast_lap_pts"],
+            dk_laps_complete_pts = None,               # not used in DK Classic
+            dk_dominator_bonus   = None,               # not used in DK Classic
+            fd_points            = fd["fd_points"],
+            fd_place_pts         = fd["fd_place_pts"],
+            fd_place_diff_pts    = fd["fd_place_diff_pts"],
+            fd_laps_led_pts      = fd["fd_laps_led_pts"],
+            fd_laps_complete_pts = fd["fd_laps_complete_pts"],
+            fd_fast_lap_pts      = 0.0,                # FD does not have fastest lap bonus
         )
 
         if existing:

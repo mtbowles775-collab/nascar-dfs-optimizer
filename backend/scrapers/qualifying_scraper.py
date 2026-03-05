@@ -11,9 +11,6 @@ from sqlalchemy.orm import Session
 from models import Race, Driver, DriverSeason, Qualifying
 
 
-NASCAR_API_BASE = "https://cf.nascar.com/cacher/2025"
-
-
 async def scrape_qualifying(race_id: int, db: Session) -> int:
     """
     Pull qualifying results for a race and save to DB.
@@ -23,8 +20,8 @@ async def scrape_qualifying(race_id: int, db: Session) -> int:
     if not race:
         raise ValueError(f"Race {race_id} not found")
 
-    # NASCAR's public JSON API — returns qualifying data
-    url = f"{NASCAR_API_BASE}/{race.season}/1/{race.race_number}/qualifying.json"
+    # Use race.season dynamically — do NOT hardcode the year
+    url = f"https://cf.nascar.com/cacher/{race.season}/{race.season}/1/{race.race_number}/qualifying.json"
 
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.get(url)
@@ -43,7 +40,6 @@ async def scrape_qualifying(race_id: int, db: Session) -> int:
 
     saved = 0
     for entry in qual_entries:
-        # NASCAR API driver name format: "Lastname, Firstname" or just full name
         driver_name     = entry.get("driver_name", "")
         car_number      = str(entry.get("car_number", ""))
         position        = int(entry.get("position", 0))
