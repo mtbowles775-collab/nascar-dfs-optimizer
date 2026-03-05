@@ -20,7 +20,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-# ── Lifespan: startup / shutdown ─────────────────────────
+# ── Lifespan: startup / shutdown ─────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Runs on startup and shutdown."""
@@ -39,7 +39,7 @@ app = FastAPI(
 )
 
 
-# ── CORS ─────────────────────────────────────────────────
+# ── CORS ──────────────────────────────────────────────────────
 # CORSMiddleware does NOT support wildcards like "https://*.vercel.app"
 # Use allow_origin_regex for Vercel preview deploys
 app.add_middleware(
@@ -48,9 +48,9 @@ app.add_middleware(
         "http://localhost:3000",
         "http://localhost:5173",
         "https://turn-four.vercel.app",
-        # TODO: Add your Turn Four production domain here:
-        # "https://turnfour.com",
-        # "https://www.turnfour.com",
+        # DraftKings — allows the salary loader console script to POST here
+        "https://www.draftkings.com",
+        "https://draftkings.com",
     ],
     allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
@@ -59,7 +59,7 @@ app.add_middleware(
 )
 
 
-# ── Register all routers ─────────────────────────────────
+# ── Register all routers ──────────────────────────────────────
 app.include_router(drivers.router,      prefix="/api/drivers",      tags=["Drivers"])
 app.include_router(tracks.router,       prefix="/api/tracks",       tags=["Tracks"])
 app.include_router(races.router,        prefix="/api/races",        tags=["Races"])
