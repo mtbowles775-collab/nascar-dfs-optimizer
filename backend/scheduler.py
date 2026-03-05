@@ -6,7 +6,7 @@
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from datetime import datetime, date
+from datetime import date
 import logging
 from database import SessionLocal
 from models import Race
@@ -78,39 +78,11 @@ async def run_qualifying_scrape():
         db.close()
 
 
-async def run_salary_scrape():
-    """
-    Auto-scrape DK salaries Tuesday + Wednesday at 9am ET.
-    DK typically posts NASCAR salaries mid-week before the race.
-    Safe to call multiple times — upserts all data.
-    """
-    db = SessionLocal()
-    try:
-        from scrapers.salary_scraper import scrape_dk_salaries
-        result = await scrape_dk_salaries(db)
-
-        if result.get("error"):
-            logger.warning(f"DK salary scraper: {result['error']}")
-        else:
-            logger.info(
-                f"DK salary scraper: {result.get('saved', 0)} saved, "
-                f"{result.get('skipped', 0)} skipped "
-                f"for {result.get('race_name')} (draftGroupId={result.get('draft_group_id')})"
-            )
-            if result.get("unmatched_players"):
-                logger.warning(f"Unmatched DK players: {result['unmatched_players']}")
-    except Exception as e:
-        logger.error(f"DK salary scraper failed: {e}", exc_info=True)
-    finally:
-        db.close()
-
-
 def start_scheduler():
     """Call this once when the FastAPI app starts."""
 
     # ── Race results via Live Feed ──
-    # Sunday: poll every 30 min from 2pm-midnight ET (covers all race windows)
-    # This catches races that end early or run late
+    # Sunday: poll every 30 min from 2pm-midnight ET
     for hour in range(14, 24):
         for minute in [0, 30]:
             scheduler.add_job(
@@ -147,20 +119,13 @@ def start_scheduler():
         replace_existing=True,
     )
 
-    # ── DraftKings Salaries ──
-    # Tue + Wed at 9am ET — DK posts NASCAR salaries mid-week
-    # Runs both days so if Tue is too early, Wed catches it
-    scheduler.add_job(
-        run_salary_scrape,
-        CronTrigger(day_of_week="tue,wed", hour=9, minute=0, timezone="America/New_York"),
-        id="dk_salary_scraper",
-        replace_existing=True,
-    )
+    # NOTE: DK salary loading is done via the SalaryLoader browser component.
+    # DK blocks Railway's IP from their API — salaries must be fetched
+    # client-side. See src/components/SalaryLoader.jsx in the frontend.
 
     scheduler.start()
     logger.info(
         "Scheduler started — "
         "live feed (Sat 12-7pm, Sun 2pm-midnight ET every 30min) + "
-        "qualifying (Fri/Sat 11pm) + "
-        "DK salaries (Tue/Wed 9am ET)"
+        "qualifying (Fri/Sat 11pm ET)"
     )

@@ -1,6 +1,5 @@
 # ============================================================
 # routers/admin.py — Admin endpoints for data management
-# Trigger scrapers, manage data, health checks
 # ============================================================
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -20,7 +19,6 @@ async def trigger_live_feed(db: Session = Depends(get_db)):
     """
     Manually trigger the live feed scraper.
     Safe to call multiple times — upserts all data.
-    Returns summary of what was scraped.
     """
     from scrapers.live_feed_scraper import scrape_live_feed
     result = await scrape_live_feed(db)
@@ -39,42 +37,133 @@ async def trigger_qualifying(race_id: int, db: Session = Depends(get_db)):
     return {"race_id": race_id, "qualifying_saved": count}
 
 
-@router.post("/scrape/salaries")
-async def trigger_salary_scrape(
+@router.post("/salaries/load-from-browser")
+async def load_salaries_from_browser(
+    payload: dict,
     db: Session = Depends(get_db),
-    draft_group_id: int | None = None,
 ):
     """
-    Manually trigger DraftKings salary scraper.
-    Finds the next scheduled Cup race and loads DK salaries.
-    Safe to call multiple times — upserts all data.
+    Receives raw DraftKings player data fetched by the browser
+    (browser bypasses DK's cloud IP block), matches drivers,
+    and saves salaries to the DB.
 
-    Optional: pass ?draft_group_id=XXXXX from the DK contest URL.
-    Find it by opening any NASCAR contest on draftkings.com and
-    copying the number from the URL. Auto-detect attempted if omitted.
+    Called by the SalaryLoader React component.
+    Payload: { draft_group_id: int, players: [...DK draftables...] }
     """
-    from scrapers.salary_scraper import scrape_dk_salaries
-    result = await scrape_dk_salaries(db, draft_group_id=draft_group_id)
+    from scrapers.salary_scraper import match_driver
+    from models import Salary
+
+    players        = payload.get("players", [])
+    draft_group_id = payload.get("draft_group_id")
+
+    if not players:
+        raise HTTPException(status_code=400, detail="No players in payload")
+
+    # Find next scheduled Cup race
+    race = (
+        db.query(Race)
+        .filter(
+            Race.race_date   >= date.today(),
+            Race.status      == "scheduled",
+            Race.race_number >  0,
+        )
+        .order_by(Race.race_date)
+        .first()
+    )
+    if not race:
+        raise HTTPException(status_code=404, detail="No upcoming race found")
+
+    saved     = 0
+    skipped   = 0
+    unmatched = []
+
+    for player in players:
+        dk_name = player.get("displayName") or player.get("playerName", "")
+        salary  = player.get("salary")
+
+        if not dk_name or not salary:
+            skipped += 1
+            continue
+
+        # Skip non-driver positions (DK sometimes includes CPT slots etc.)
+        position = (player.get("position") or "").upper()
+        if position and position not in ("D", "DR", "DRIVER", ""):
+            skipped += 1
+            continue
+
+        driver_id = match_driver(db, dk_name, race.season)
+        if not driver_id:
+            unmatched.append(dk_name)
+            skipped += 1
+            continue
+
+        # Calculate salary change vs most recent previous race
+        prev = db.query(Salary).filter(
+            Salary.driver_id       == driver_id,
+            Salary.platform        == "draftkings",
+            Salary.roster_position == "driver",
+        ).order_by(Salary.created_at.desc()).first()
+
+        salary_change = None
+        if prev and prev.race_id != race.id:
+            salary_change = salary - prev.salary
+
+        # Upsert
+        existing = db.query(Salary).filter(
+            Salary.race_id         == race.id,
+            Salary.driver_id       == driver_id,
+            Salary.platform        == "draftkings",
+            Salary.roster_position == "driver",
+        ).first()
+
+        if existing:
+            existing.salary        = salary
+            existing.salary_change = salary_change
+        else:
+            db.add(Salary(
+                race_id         = race.id,
+                driver_id       = driver_id,
+                platform        = "draftkings",
+                salary          = salary,
+                salary_change   = salary_change,
+                roster_position = "driver",
+            ))
+        saved += 1
+
+    db.commit()
+
+    result = {
+        "race_id":        race.id,
+        "race_name":      race.race_name,
+        "race_date":      str(race.race_date),
+        "draft_group_id": draft_group_id,
+        "platform":       "draftkings",
+        "saved":          saved,
+        "skipped":        skipped,
+    }
+    if unmatched:
+        result["unmatched_players"] = unmatched
+
+    logger.info(f"Browser salary load: {saved} saved for {race.race_name}")
     return result
 
 
 @router.get("/data-status")
 def data_status(db: Session = Depends(get_db)):
-    """Overview of data completeness — useful for monitoring."""
+    """Overview of data completeness."""
     from sqlalchemy import func
     from models import Driver, Track, Salary, Simulation
 
-    total_drivers   = db.query(func.count(Driver.id)).scalar()
-    active_drivers  = db.query(func.count(Driver.id)).filter(Driver.active == True).scalar()
-    total_tracks    = db.query(func.count(Track.id)).scalar()
-    total_races     = db.query(func.count(Race.id)).scalar()
-    total_results   = db.query(func.count(Result.id)).scalar()
-    total_loop      = db.query(func.count(LoopData.id)).scalar()
-    total_qual      = db.query(func.count(Qualifying.id)).scalar()
-    total_salaries  = db.query(func.count(Salary.id)).scalar()
-    total_sims      = db.query(func.count(Simulation.id)).scalar()
+    total_drivers  = db.query(func.count(Driver.id)).scalar()
+    active_drivers = db.query(func.count(Driver.id)).filter(Driver.active == True).scalar()
+    total_tracks   = db.query(func.count(Track.id)).scalar()
+    total_races    = db.query(func.count(Race.id)).scalar()
+    total_results  = db.query(func.count(Result.id)).scalar()
+    total_loop     = db.query(func.count(LoopData.id)).scalar()
+    total_qual     = db.query(func.count(Qualifying.id)).scalar()
+    total_salaries = db.query(func.count(Salary.id)).scalar()
+    total_sims     = db.query(func.count(Simulation.id)).scalar()
 
-    # Current season stats
     current_year = date.today().year
     season_races = db.query(func.count(Race.id)).filter(Race.season == current_year).scalar()
     completed    = db.query(func.count(Race.id)).filter(
@@ -97,10 +186,10 @@ def data_status(db: Session = Depends(get_db)):
             "simulations":    total_sims,
         },
         "current_season": {
-            "year":         current_year,
-            "total_races":  season_races,
-            "completed":    completed,
-            "scheduled":    scheduled,
+            "year":        current_year,
+            "total_races": season_races,
+            "completed":   completed,
+            "scheduled":   scheduled,
         },
     }
 
@@ -129,51 +218,11 @@ def next_race_info(db: Session = Depends(get_db)):
     ).scalar()
 
     return {
-        "race_id":      race.id,
-        "race_name":    race.race_name,
-        "race_date":    str(race.race_date),
-        "race_number":  race.race_number,
-        "qualifying":   qual_count,
-        "salaries":     salary_count,
-        "ready":        qual_count > 0 and salary_count > 0,
+        "race_id":     race.id,
+        "race_name":   race.race_name,
+        "race_date":   str(race.race_date),
+        "race_number": race.race_number,
+        "qualifying":  qual_count,
+        "salaries":    salary_count,
+        "ready":       qual_count > 0 and salary_count > 0,
     }
-
-
-@router.get("/debug/dk-contests")
-async def debug_dk_contests():
-    """
-    Temp debug endpoint — shows exactly what the draft-kings package
-    returns for NASCAR contests so we can fix the keyword filter.
-    Remove once salary scraper is working.
-    """
-    import asyncio
-    def _fetch():
-        try:
-            from draft_kings import Client, Sport
-            client = Client()
-            result = client.contests(sport=Sport.NASCAR)
-            contests = getattr(result, "contests", []) or []
-            draft_groups = getattr(result, "draft_groups", []) or []
-            return {
-                "contests": [
-                    {
-                        "name": getattr(c, "name", None),
-                        "draft_group_id": getattr(c, "draft_group_id", None),
-                        "sport": str(getattr(c, "sport", None)),
-                    }
-                    for c in contests[:20]  # first 20 only
-                ],
-                "draft_groups": [
-                    {
-                        "draft_group_id": getattr(dg, "draft_group_id", None),
-                        "game_type_name": getattr(dg, "game_type_name", None),
-                        "sport": str(getattr(dg, "sport", None)),
-                    }
-                    for dg in draft_groups[:10]
-                ],
-            }
-        except Exception as e:
-            return {"error": str(e)}
-
-    result = await asyncio.to_thread(_fetch)
-    return result
