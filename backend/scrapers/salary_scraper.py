@@ -3,15 +3,15 @@
 # Auto-scrapes DraftKings NASCAR salaries — no CSV needed.
 #
 # Flow:
-#   1. Use `draft-kings` PyPI package to find upcoming NASCAR Classic contest
-#      (bypasses the 403 that direct lobby calls get from cloud servers)
-#   2. Extract draftGroupId
-#   3. Hit draftables API directly → get all players + salaries
-#   4. Match players to our drivers table by name
-#   5. Upsert into salaries table for the next scheduled race
+#   1. Accept a draftGroupId (from DK contest URL) OR try api.draftkings.com
+#      to find it automatically
+#   2. Hit draftables API → get all players + salaries
+#   3. Match players to our drivers table by name
+#   4. Upsert into salaries table for the next scheduled race
 #
-# Triggered by: POST /api/admin/scrape/salaries
-# Scheduled:    Tuesday + Wednesday 9am ET (auto via scheduler)
+# Triggered by: POST /api/admin/scrape/salaries?draft_group_id=12345
+# Scheduled:    Tuesday + Wednesday 9am ET — but needs draft_group_id set
+#               in DB or passed manually each week
 # ============================================================
 
 import asyncio
@@ -22,48 +22,53 @@ from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
 
-DK_DRAFTABLES_URL = "https://api.draftkings.com/draftgroups/v1/draftgroups/{draft_group_id}/draftables"
+DK_DRAFTABLES_URL  = "https://api.draftkings.com/draftgroups/v1/draftgroups/{draft_group_id}/draftables"
+DK_DRAFTGROUPS_URL = "https://api.draftkings.com/draftgroups/v1/draftgroups?sportId=6"  # 6 = NASCAR on DK
 
 # Keywords to identify NASCAR Cup Classic contests (exclude Showdown/Xfinity/Trucks)
-DK_CLASSIC_KEYWORDS = ["nascar", "cup", "classic"]
+DK_CLASSIC_KEYWORDS = ["nascar", "cup", "classic", "500", "400", "300", "phoenix", "race"]
 DK_EXCLUDE_KEYWORDS = ["showdown", "tiers", "tier", "xfinity", "trucks", "craftsman"]
 
 
-def _find_nascar_draft_group_via_package() -> tuple[int | None, str | None]:
+async def _find_nascar_draft_group_auto() -> tuple[int | None, str | None]:
     """
-    Use the draft-kings package to find the upcoming NASCAR Classic draft group.
-    This package handles DK's bot-blocking better than direct requests.
-    Runs synchronously — called via asyncio.to_thread() from async context.
+    Try to find the NASCAR Cup draft group via api.draftkings.com (not the blocked lobby).
     Returns (draftGroupId, name) or (None, None).
     """
-    try:
-        from draft_kings import Client, Sport
-        client = Client()
-        result = client.contests(sport=Sport.NASCAR)
-    except Exception as e:
-        logger.error(f"draft-kings package error fetching contests: {e}")
-        return None, None
+    async with httpx.AsyncClient(
+        timeout=15,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json",
+        }
+    ) as client:
+        try:
+            resp = await client.get(DK_DRAFTGROUPS_URL)
+            if resp.status_code != 200:
+                logger.warning(f"DK draftgroups API returned {resp.status_code}")
+                return None, None
 
-    contests = getattr(result, "contests", []) or []
+            data = resp.json()
+            draft_groups = data.get("draftGroups", [])
 
-    for contest in contests:
-        name = (getattr(contest, "name", "") or "").lower()
+            for dg in draft_groups:
+                game_type = (dg.get("gameType") or dg.get("gameTypeName") or "").lower()
+                contest_type = (dg.get("contestType") or "").lower()
+                name = (dg.get("name") or game_type or "").lower()
 
-        if not any(kw in name for kw in DK_CLASSIC_KEYWORDS):
-            continue
-        if any(kw in name for kw in DK_EXCLUDE_KEYWORDS):
-            continue
+                # Must not be Showdown/Xfinity/Trucks
+                if any(kw in name for kw in DK_EXCLUDE_KEYWORDS):
+                    continue
+                if any(kw in contest_type for kw in DK_EXCLUDE_KEYWORDS):
+                    continue
 
-        draft_group_id = getattr(contest, "draft_group_id", None)
-        if draft_group_id:
-            return draft_group_id, getattr(contest, "name", "")
+                # Classic NASCAR — return first match
+                dg_id = dg.get("draftGroupId")
+                if dg_id:
+                    return dg_id, dg.get("name") or game_type
 
-    # Fallback: check draft_groups attribute
-    draft_groups = getattr(result, "draft_groups", []) or []
-    for dg in draft_groups:
-        game_type = (getattr(dg, "game_type_name", "") or "").lower()
-        if "nascar" in game_type and "showdown" not in game_type:
-            return getattr(dg, "draft_group_id", None), game_type
+        except Exception as e:
+            logger.error(f"Auto draft group lookup failed: {e}")
 
     return None, None
 
@@ -100,7 +105,6 @@ def _match_driver(db: Session, dk_name: str, race_season: int):
     if len(matches) == 1:
         return matches[0].id
     if len(matches) > 1:
-        # Multiple same last name -- narrow by season entry
         for m in matches:
             season_entry = db.query(DriverSeason).filter(
                 DriverSeason.driver_id == m.id,
@@ -109,7 +113,7 @@ def _match_driver(db: Session, dk_name: str, race_season: int):
             if season_entry:
                 return m.id
 
-    # 3. Last word of name only (e.g. "Jr." suffix edge cases)
+    # 3. Last word of name only (Jr. suffix edge cases)
     last_word = parts[-1]
     if last_word.lower() != last.lower():
         matches2 = db.query(Driver).filter(
@@ -122,10 +126,13 @@ def _match_driver(db: Session, dk_name: str, race_season: int):
     return None
 
 
-async def scrape_dk_salaries(db: Session) -> dict:
+async def scrape_dk_salaries(db: Session, draft_group_id: int | None = None) -> dict:
     """
     Main entry point. Finds the next scheduled Cup race, scrapes DK salaries,
     and upserts into the salaries table.
+
+    draft_group_id: Pass explicitly from the DK contest URL, or leave None to
+                    attempt auto-detection via api.draftkings.com.
     Returns a summary dict.
     """
     from models import Race, Salary
@@ -145,20 +152,26 @@ async def scrape_dk_salaries(db: Session) -> dict:
     if not race:
         return {"error": "No upcoming Cup race found"}
 
-    # Step 1: Find NASCAR draft group via package (sync call -- run in thread)
-    logger.info("Finding NASCAR DK draft group via draft-kings package...")
-    draft_group_id, contest_name = await asyncio.to_thread(_find_nascar_draft_group_via_package)
+    contest_name = None
 
-    if not draft_group_id:
-        return {
-            "error": "No NASCAR Classic draft group found. "
-                     "Salaries may not be posted yet (typically Tuesday-Wednesday)."
-        }
+    # Step 1: Get draft group ID
+    if draft_group_id:
+        logger.info(f"Using provided draftGroupId: {draft_group_id}")
+        contest_name = f"manual (id={draft_group_id})"
+    else:
+        logger.info("Attempting auto-detect of NASCAR DK draft group...")
+        draft_group_id, contest_name = await _find_nascar_draft_group_auto()
 
-    logger.info(f"Found DK draft group {draft_group_id}: {contest_name}")
+        if not draft_group_id:
+            return {
+                "error": "Could not auto-detect NASCAR draft group. "
+                         "Pass draft_group_id manually: POST /api/admin/scrape/salaries?draft_group_id=XXXXX "
+                         "Find it in the DK contest URL when you open a NASCAR contest."
+            }
 
-    # Step 2: Get draftables (players + salaries)
-    # This endpoint does not get 403'd from cloud IPs
+    logger.info(f"Using DK draft group {draft_group_id}: {contest_name}")
+
+    # Step 2: Get draftables (players + salaries) — this endpoint is never blocked
     async with httpx.AsyncClient(
         timeout=20,
         headers={

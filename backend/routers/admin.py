@@ -40,15 +40,21 @@ async def trigger_qualifying(race_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/scrape/salaries")
-async def trigger_salary_scrape(db: Session = Depends(get_db)):
+async def trigger_salary_scrape(
+    db: Session = Depends(get_db),
+    draft_group_id: int | None = None,
+):
     """
     Manually trigger DraftKings salary scraper.
     Finds the next scheduled Cup race and loads DK salaries.
     Safe to call multiple times — upserts all data.
-    Salaries typically post Tuesday–Wednesday race week.
+
+    Optional: pass ?draft_group_id=XXXXX from the DK contest URL.
+    Find it by opening any NASCAR contest on draftkings.com and
+    copying the number from the URL. Auto-detect attempted if omitted.
     """
     from scrapers.salary_scraper import scrape_dk_salaries
-    result = await scrape_dk_salaries(db)
+    result = await scrape_dk_salaries(db, draft_group_id=draft_group_id)
     return result
 
 
