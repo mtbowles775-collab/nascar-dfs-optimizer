@@ -77,20 +77,21 @@ class Team(Base):
 # ── Drivers ──────────────────────────────────────────────
 class Driver(Base):
     __tablename__ = "drivers"
-    id              = Column(Integer, primary_key=True)
-    first_name      = Column(String(50), nullable=False)
-    last_name       = Column(String(50), nullable=False)
-    nationality     = Column(String(50), default="American")
-    birth_date      = Column(Date)
-    active          = Column(Boolean, default=True)
-    created_at      = Column(DateTime, server_default=func.now())
-    seasons         = relationship("DriverSeason", back_populates="driver")
-    results         = relationship("Result", back_populates="driver")
-    qualifying      = relationship("Qualifying", back_populates="driver")
-    practice        = relationship("Practice", back_populates="driver")
-    loop_data       = relationship("LoopData", back_populates="driver")
-    ownership       = relationship("Ownership", back_populates="driver")
-    salaries        = relationship("Salary", back_populates="driver")
+    id                  = Column(Integer, primary_key=True)
+    first_name          = Column(String(50), nullable=False)
+    last_name           = Column(String(50), nullable=False)
+    nascar_driver_id    = Column(Integer, unique=True, index=True)   # NASCAR.com internal ID
+    nationality         = Column(String(50), default="American")
+    birth_date          = Column(Date)
+    active              = Column(Boolean, default=True)
+    created_at          = Column(DateTime, server_default=func.now())
+    seasons             = relationship("DriverSeason", back_populates="driver")
+    results             = relationship("Result", back_populates="driver")
+    qualifying          = relationship("Qualifying", back_populates="driver")
+    practice            = relationship("Practice", back_populates="driver")
+    loop_data           = relationship("LoopData", back_populates="driver")
+    ownership           = relationship("Ownership", back_populates="driver")
+    salaries            = relationship("Salary", back_populates="driver")
 
     @property
     def full_name(self):
@@ -119,18 +120,21 @@ class Race(Base):
     race_number     = Column(Integer, nullable=False)
     series          = Column(String(20), default="cup", nullable=False)  # cup | xfinity | trucks
     track_id        = Column(Integer, ForeignKey("tracks.id"), nullable=False)
+    nascar_race_id  = Column(Integer, index=True)                    # NASCAR.com internal ID
     race_name       = Column(String(150))
     race_date       = Column(Date)
     scheduled_laps  = Column(Integer, nullable=False)
     actual_laps     = Column(Integer)
     stage1_laps     = Column(Integer)
     stage2_laps     = Column(Integer)
-    stage3_laps     = Column(Integer)
+    stage3_laps     = Column(Integer)                                # ADDED: populated by live feed
     total_miles     = Column(Numeric(7, 2))
-    caution_count   = Column(Integer)                               # NEW: for caution modeling
-    caution_laps    = Column(Integer)                               # NEW: for caution modeling
-    lead_changes    = Column(Integer)                               # NEW: dominator analysis
-    leaders_count   = Column(Integer)                               # NEW: dominator analysis
+    caution_count   = Column(Integer)                                # historical caution count
+    caution_laps    = Column(Integer)                                # historical caution laps
+    caution_segments= Column(Integer)                                # ADDED: live feed caution segments
+    lead_changes    = Column(Integer)                                # for dominator analysis
+    leaders_count   = Column(Integer)                                # unique leaders
+    number_of_leaders = Column(Integer)                              # ADDED: live feed leaders count
     status          = Column(String(20), default="scheduled")
     notes           = Column(Text)
     created_at      = Column(DateTime, server_default=func.now())
@@ -196,6 +200,7 @@ class Result(Base):
     fastest_lap_speed   = Column(Numeric(7, 3))
     green_flag_laps     = Column(Integer)
     green_flag_speed    = Column(Numeric(7, 3))
+    driver_rating       = Column(Numeric(6, 2))
     dk_salary           = Column(Integer)
     dk_points           = Column(Numeric(6, 2))
     dk_place_pts        = Column(Numeric(6, 2))
@@ -235,13 +240,14 @@ class LoopData(Base):
     fastest_lap_pct         = Column(Numeric(5, 2))
     avg_running_position    = Column(Numeric(5, 2))
     driver_rating           = Column(Numeric(6, 2))
-    passing_differential    = Column(Integer, default=0)            # NEW: from live feed
-    avg_speed               = Column(Numeric(7, 3))                 # NEW: from live feed
-    avg_restart_speed       = Column(Numeric(7, 3))                 # NEW: from live feed
-    best_lap_speed          = Column(Numeric(7, 3))                 # NEW: from live feed
+    passing_differential    = Column(Integer, default=0)
+    avg_speed               = Column(Numeric(7, 3))
+    avg_restart_speed       = Column(Numeric(7, 3))
+    best_lap_speed          = Column(Numeric(7, 3))
+    laps_position_improved  = Column(Integer, default=0)            # ADDED: from live feed
     stage1_points           = Column(Integer, default=0)
     stage2_points           = Column(Integer, default=0)
-    stage3_points           = Column(Integer, default=0)            # NEW: 3rd stage
+    stage3_points           = Column(Integer, default=0)
     stage_points_total      = Column(Integer, default=0)
     created_at              = Column(DateTime, server_default=func.now())
     __table_args__          = (UniqueConstraint("race_id", "driver_id"),)
