@@ -131,3 +131,43 @@ def next_race_info(db: Session = Depends(get_db)):
         "salaries":     salary_count,
         "ready":        qual_count > 0 and salary_count > 0,
     }
+
+
+@router.get("/debug/dk-contests")
+async def debug_dk_contests():
+    """
+    Temp debug endpoint — shows exactly what the draft-kings package
+    returns for NASCAR contests so we can fix the keyword filter.
+    Remove once salary scraper is working.
+    """
+    import asyncio
+    def _fetch():
+        try:
+            from draft_kings import Client, Sport
+            client = Client()
+            result = client.contests(sport=Sport.NASCAR)
+            contests = getattr(result, "contests", []) or []
+            draft_groups = getattr(result, "draft_groups", []) or []
+            return {
+                "contests": [
+                    {
+                        "name": getattr(c, "name", None),
+                        "draft_group_id": getattr(c, "draft_group_id", None),
+                        "sport": str(getattr(c, "sport", None)),
+                    }
+                    for c in contests[:20]  # first 20 only
+                ],
+                "draft_groups": [
+                    {
+                        "draft_group_id": getattr(dg, "draft_group_id", None),
+                        "game_type_name": getattr(dg, "game_type_name", None),
+                        "sport": str(getattr(dg, "sport", None)),
+                    }
+                    for dg in draft_groups[:10]
+                ],
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    result = await asyncio.to_thread(_fetch)
+    return result
