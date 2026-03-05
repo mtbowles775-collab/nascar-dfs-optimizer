@@ -3,7 +3,7 @@
 # ============================================================
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session, joinedload
-from sqlalchemy import func, and_
+from sqlalchemy import func, and_, Integer
 from typing import List, Optional
 from database import get_db
 from models import Driver, DriverSeason, Result, Race, Track, TrackType
@@ -92,7 +92,7 @@ def get_track_type_averages(driver_id: int, db: Session = Depends(get_db)):
             func.avg(Result.dk_points).label("avg_dk_pts"),
             func.avg(Result.fd_points).label("avg_fd_pts"),
             func.avg(Result.green_flag_speed).label("avg_gf_speed"),
-            func.sum(func.cast(Result.fastest_lap, db.bind.dialect.name == 'postgresql' and 'integer' or 'integer')).label("fast_laps"),
+            func.sum(func.cast(Result.fastest_lap, Integer)).label("fast_laps"),
         )
         .join(Race, Result.race_id == Race.id)
         .join(Track, Race.track_id == Track.id)
