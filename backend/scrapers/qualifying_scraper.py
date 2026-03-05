@@ -21,7 +21,8 @@ async def scrape_qualifying(race_id: int, db: Session) -> int:
         raise ValueError(f"Race {race_id} not found")
 
     # Use race.season dynamically — do NOT hardcode the year
-    url = f"https://cf.nascar.com/cacher/{race.season}/{race.season}/1/{race.race_number}/qualifying.json"
+    # Correct format: /cacher/{season}/1/{race_number}/qualifying.json
+    url = f"https://cf.nascar.com/cacher/{race.season}/1/{race.race_number}/qualifying.json"
 
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.get(url)
