@@ -39,6 +39,19 @@ async def trigger_qualifying(race_id: int, db: Session = Depends(get_db)):
     return {"race_id": race_id, "qualifying_saved": count}
 
 
+@router.post("/scrape/salaries")
+async def trigger_salary_scrape(db: Session = Depends(get_db)):
+    """
+    Manually trigger DraftKings salary scraper.
+    Finds the next scheduled Cup race and loads DK salaries.
+    Safe to call multiple times — upserts all data.
+    Salaries typically post Tuesday–Wednesday race week.
+    """
+    from scrapers.salary_scraper import scrape_dk_salaries
+    result = await scrape_dk_salaries(db)
+    return result
+
+
 @router.get("/data-status")
 def data_status(db: Session = Depends(get_db)):
     """Overview of data completeness — useful for monitoring."""
@@ -67,15 +80,15 @@ def data_status(db: Session = Depends(get_db)):
 
     return {
         "totals": {
-            "drivers":      total_drivers,
+            "drivers":        total_drivers,
             "active_drivers": active_drivers,
-            "tracks":       total_tracks,
-            "races":        total_races,
-            "results":      total_results,
-            "loop_data":    total_loop,
-            "qualifying":   total_qual,
-            "salaries":     total_salaries,
-            "simulations":  total_sims,
+            "tracks":         total_tracks,
+            "races":          total_races,
+            "results":        total_results,
+            "loop_data":      total_loop,
+            "qualifying":     total_qual,
+            "salaries":       total_salaries,
+            "simulations":    total_sims,
         },
         "current_season": {
             "year":         current_year,

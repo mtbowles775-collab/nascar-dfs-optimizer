@@ -78,6 +78,33 @@ async def run_qualifying_scrape():
         db.close()
 
 
+async def run_salary_scrape():
+    """
+    Auto-scrape DK salaries Tuesday + Wednesday at 9am ET.
+    DK typically posts NASCAR salaries mid-week before the race.
+    Safe to call multiple times — upserts all data.
+    """
+    db = SessionLocal()
+    try:
+        from scrapers.salary_scraper import scrape_dk_salaries
+        result = await scrape_dk_salaries(db)
+
+        if result.get("error"):
+            logger.warning(f"DK salary scraper: {result['error']}")
+        else:
+            logger.info(
+                f"DK salary scraper: {result.get('saved', 0)} saved, "
+                f"{result.get('skipped', 0)} skipped "
+                f"for {result.get('race_name')} (draftGroupId={result.get('draft_group_id')})"
+            )
+            if result.get("unmatched_players"):
+                logger.warning(f"Unmatched DK players: {result['unmatched_players']}")
+    except Exception as e:
+        logger.error(f"DK salary scraper failed: {e}", exc_info=True)
+    finally:
+        db.close()
+
+
 def start_scheduler():
     """Call this once when the FastAPI app starts."""
 
@@ -112,7 +139,7 @@ def start_scheduler():
             replace_existing=True,
         )
 
-    # ── Qualifying (keep existing schedule) ──
+    # ── Qualifying ──
     scheduler.add_job(
         run_qualifying_scrape,
         CronTrigger(day_of_week="fri,sat", hour=23, minute=0, timezone="America/New_York"),
@@ -120,9 +147,20 @@ def start_scheduler():
         replace_existing=True,
     )
 
+    # ── DraftKings Salaries ──
+    # Tue + Wed at 9am ET — DK posts NASCAR salaries mid-week
+    # Runs both days so if Tue is too early, Wed catches it
+    scheduler.add_job(
+        run_salary_scrape,
+        CronTrigger(day_of_week="tue,wed", hour=9, minute=0, timezone="America/New_York"),
+        id="dk_salary_scraper",
+        replace_existing=True,
+    )
+
     scheduler.start()
     logger.info(
         "Scheduler started — "
         "live feed (Sat 12-7pm, Sun 2pm-midnight ET every 30min) + "
-        "qualifying (Fri/Sat 11pm)"
+        "qualifying (Fri/Sat 11pm) + "
+        "DK salaries (Tue/Wed 9am ET)"
     )
