@@ -51,6 +51,8 @@ app.add_middleware(
         # DraftKings — allows the salary loader console script to POST here
         "https://www.draftkings.com",
         "https://draftkings.com",
+        "https://www.fanduel.com",
+        "https://fanduel.com",
     ],
     allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
