@@ -16,10 +16,6 @@ router = APIRouter()
 
 @router.post("/scrape/live-feed")
 async def trigger_live_feed(db: Session = Depends(get_db)):
-    """
-    Manually trigger the live feed scraper.
-    Safe to call multiple times — upserts all data.
-    """
     from scrapers.live_feed_scraper import scrape_live_feed
     result = await scrape_live_feed(db)
     return result
@@ -27,11 +23,9 @@ async def trigger_live_feed(db: Session = Depends(get_db)):
 
 @router.post("/scrape/qualifying/{race_id}")
 async def trigger_qualifying(race_id: int, db: Session = Depends(get_db)):
-    """Manually trigger qualifying scraper for a specific race."""
     race = db.query(Race).filter(Race.id == race_id).first()
     if not race:
         raise HTTPException(status_code=404, detail=f"Race {race_id} not found")
-
     from scrapers.qualifying_scraper import scrape_qualifying
     count = await scrape_qualifying(race_id, db)
     return {"race_id": race_id, "qualifying_saved": count}
@@ -43,18 +37,18 @@ async def load_salaries_from_browser(
     db: Session = Depends(get_db),
 ):
     """
-    Receives raw DraftKings player data fetched by the browser
-    (browser bypasses DK's cloud IP block), matches drivers,
-    and saves salaries to the DB.
+    Receives raw player data fetched by the browser from DK or FanDuel,
+    matches drivers, and saves salaries to the DB.
 
-    Called by the SalaryLoader React component.
-    Payload: { draft_group_id: int, players: [...DK draftables...] }
+    DK payload:   { draft_group_id: int, players: [...DK draftables...] }
+    FD payload:   { platform: "fanduel", draft_group_id: str, players: [...FD players...] }
     """
     from scrapers.salary_scraper import match_driver
     from models import Salary
 
     players        = payload.get("players", [])
     draft_group_id = payload.get("draft_group_id")
+    platform       = payload.get("platform", "draftkings").lower()
 
     if not players:
         raise HTTPException(status_code=400, detail="No players in payload")
@@ -78,29 +72,44 @@ async def load_salaries_from_browser(
     unmatched = []
 
     for player in players:
-        dk_name = player.get("displayName") or player.get("playerName", "")
-        salary  = player.get("salary")
+        # ── Parse name + salary based on platform ──────────────
+        if platform == "fanduel":
+            first = player.get("first_name") or player.get("firstName", "")
+            last  = player.get("last_name")  or player.get("lastName", "")
+            # Handle FD Redux store format (first_name/last_name fields)
+            if first and last:
+                name = f"{first} {last}"
+            else:
+                name = player.get("displayName", "")
+            salary   = player.get("salary")
+            position = (player.get("rosterPosition") or player.get("position") or "Driver").upper()
+            # FD: skip non-driver positions
+            if position and position not in ("D", "DR", "DRIVER", ""):
+                skipped += 1
+                continue
+        else:
+            # DraftKings format
+            name     = player.get("displayName") or player.get("playerName", "")
+            salary   = player.get("salary")
+            position = (player.get("position") or "").upper()
+            if position and position not in ("D", "DR", "DRIVER", ""):
+                skipped += 1
+                continue
 
-        if not dk_name or not salary:
+        if not name or not salary:
             skipped += 1
             continue
 
-        # Skip non-driver positions (DK sometimes includes CPT slots etc.)
-        position = (player.get("position") or "").upper()
-        if position and position not in ("D", "DR", "DRIVER", ""):
-            skipped += 1
-            continue
-
-        driver_id = match_driver(db, dk_name, race.season)
+        driver_id = match_driver(db, name, race.season)
         if not driver_id:
-            unmatched.append(dk_name)
+            unmatched.append(name)
             skipped += 1
             continue
 
-        # Calculate salary change vs most recent previous race
+        # Salary change vs most recent previous salary for this platform
         prev = db.query(Salary).filter(
             Salary.driver_id       == driver_id,
-            Salary.platform        == "draftkings",
+            Salary.platform        == platform,
             Salary.roster_position == "driver",
         ).order_by(Salary.created_at.desc()).first()
 
@@ -112,7 +121,7 @@ async def load_salaries_from_browser(
         existing = db.query(Salary).filter(
             Salary.race_id         == race.id,
             Salary.driver_id       == driver_id,
-            Salary.platform        == "draftkings",
+            Salary.platform        == platform,
             Salary.roster_position == "driver",
         ).first()
 
@@ -123,7 +132,7 @@ async def load_salaries_from_browser(
             db.add(Salary(
                 race_id         = race.id,
                 driver_id       = driver_id,
-                platform        = "draftkings",
+                platform        = platform,
                 salary          = salary,
                 salary_change   = salary_change,
                 roster_position = "driver",
@@ -137,20 +146,19 @@ async def load_salaries_from_browser(
         "race_name":      race.race_name,
         "race_date":      str(race.race_date),
         "draft_group_id": draft_group_id,
-        "platform":       "draftkings",
+        "platform":       platform,
         "saved":          saved,
         "skipped":        skipped,
     }
     if unmatched:
         result["unmatched_players"] = unmatched
 
-    logger.info(f"Browser salary load: {saved} saved for {race.race_name}")
+    logger.info(f"Browser salary load ({platform}): {saved} saved for {race.race_name}")
     return result
 
 
 @router.get("/data-status")
 def data_status(db: Session = Depends(get_db)):
-    """Overview of data completeness."""
     from sqlalchemy import func
     from models import Driver, Track, Salary, Simulation
 
@@ -196,7 +204,6 @@ def data_status(db: Session = Depends(get_db)):
 
 @router.get("/next-race")
 def next_race_info(db: Session = Depends(get_db)):
-    """Quick check: what's the next race and is data ready?"""
     from models import Salary
     from sqlalchemy import func
 
