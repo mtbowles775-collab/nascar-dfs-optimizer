@@ -1,7 +1,12 @@
 # ============================================================
 # scheduler.py
-# APScheduler — fires scrapers automatically on race weekends
+# APScheduler — fires qualifying scraper on race weekends
 # Runs inside the FastAPI process on Railway
+#
+# Race results + loop data: loaded post-race via Racing Reference
+#   browser console script (see Admin tab in frontend).
+# Salaries: loaded via DK/FD browser console scripts (Admin tab).
+# Qualifying: auto-scraped from NASCAR API (below).
 # ============================================================
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -31,35 +36,6 @@ def get_current_race_id() -> int | None:
         db.close()
 
 
-async def run_live_feed_scrape():
-    """
-    Poll the NASCAR live feed for race results + loop data.
-    Called multiple times on race day — safe to call repeatedly (upserts).
-    Only processes data when run_type=3 (race) and race is in progress or complete.
-    """
-    db = SessionLocal()
-    try:
-        from scrapers.live_feed_scraper import scrape_live_feed
-        result = await scrape_live_feed(db)
-
-        if result.get("error"):
-            logger.warning(f"Live feed scraper: {result['error']}")
-        elif result.get("skipped"):
-            logger.info(f"Live feed scraper skipped: {result['reason']}")
-        else:
-            logger.info(
-                f"Live feed scraper: {result['race_name']} at {result['track_name']} "
-                f"({result['laps']}) — {result['results_saved']} results, "
-                f"{result['loop_data_saved']} loop data records"
-            )
-            if result.get("is_complete"):
-                logger.info("Race is COMPLETE — final results captured ✅")
-    except Exception as e:
-        logger.error(f"Live feed scraper failed: {e}", exc_info=True)
-    finally:
-        db.close()
-
-
 async def run_qualifying_scrape():
     """Fired Friday night + Saturday night at 11pm ET."""
     race_id = get_current_race_id()
@@ -81,37 +57,7 @@ async def run_qualifying_scrape():
 def start_scheduler():
     """Call this once when the FastAPI app starts."""
 
-    # ── Race results via Live Feed ──
-    # Sunday: poll every 30 min from 2pm-midnight ET
-    for hour in range(14, 24):
-        for minute in [0, 30]:
-            scheduler.add_job(
-                run_live_feed_scrape,
-                CronTrigger(
-                    day_of_week="sun",
-                    hour=hour,
-                    minute=minute,
-                    timezone="America/New_York",
-                ),
-                id=f"live_feed_{hour}_{minute}",
-                replace_existing=True,
-            )
-
-    # Saturday races (road courses, some Xfinity/Trucks)
-    for hour in range(12, 20):
-        scheduler.add_job(
-            run_live_feed_scrape,
-            CronTrigger(
-                day_of_week="sat",
-                hour=hour,
-                minute=0,
-                timezone="America/New_York",
-            ),
-            id=f"live_feed_sat_{hour}",
-            replace_existing=True,
-        )
-
-    # ── Qualifying ──
+    # ── Qualifying (auto) ──
     scheduler.add_job(
         run_qualifying_scrape,
         CronTrigger(day_of_week="fri,sat", hour=23, minute=0, timezone="America/New_York"),
@@ -119,13 +65,10 @@ def start_scheduler():
         replace_existing=True,
     )
 
-    # NOTE: DK salary loading is done via the SalaryLoader browser component.
-    # DK blocks Railway's IP from their API — salaries must be fetched
-    # client-side. See src/components/SalaryLoader.jsx in the frontend.
-
     scheduler.start()
     logger.info(
         "Scheduler started — "
-        "live feed (Sat 12-7pm, Sun 2pm-midnight ET every 30min) + "
-        "qualifying (Fri/Sat 11pm ET)"
+        "qualifying (Fri/Sat 11pm ET). "
+        "Race results: Racing Reference browser script. "
+        "Salaries: DK/FD browser scripts."
     )

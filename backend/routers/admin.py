@@ -14,13 +14,6 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-@router.post("/scrape/live-feed")
-async def trigger_live_feed(db: Session = Depends(get_db)):
-    from scrapers.live_feed_scraper import scrape_live_feed
-    result = await scrape_live_feed(db)
-    return result
-
-
 @router.post("/scrape/qualifying/{race_id}")
 async def trigger_qualifying(race_id: int, db: Session = Depends(get_db)):
     race = db.query(Race).filter(Race.id == race_id).first()
@@ -155,6 +148,195 @@ async def load_salaries_from_browser(
 
     logger.info(f"Browser salary load ({platform}): {saved} saved for {race.race_name}")
     return result
+
+
+@router.post("/race-results/load-from-browser")
+async def load_race_results_from_browser(
+    payload: dict,
+    db: Session = Depends(get_db),
+):
+    """
+    Receives race results + loop data scraped from Racing Reference
+    by the browser console script.
+
+    Payload: {
+      race_number: int,        # e.g. 3
+      season: int,             # e.g. 2026
+      race_meta: { cautions, caution_laps, lead_changes, actual_laps },
+      results: [ { driver, finish, start, laps, status, laps_led } ],
+      loop_data: [ { driver, start, mid_race, finish, high_pos, low_pos,
+                     avg_pos, pass_diff, gf_passes, gf_times_passed,
+                     quality_passes, pct_quality_passes, fastest_laps,
+                     top15_laps, pct_top15, laps_led, pct_laps_led,
+                     total_laps, driver_rating } ]
+    }
+    """
+    from scrapers.salary_scraper import match_driver
+    from scoring import calc_all_points
+
+    race_number = payload.get("race_number")
+    season      = payload.get("season")
+    results_arr = payload.get("results", [])
+    loop_arr    = payload.get("loop_data", [])
+    race_meta   = payload.get("race_meta", {})
+
+    if not race_number or not season:
+        raise HTTPException(status_code=400, detail="race_number and season required")
+    if not results_arr:
+        raise HTTPException(status_code=400, detail="No results in payload")
+
+    # Find the race
+    race = (
+        db.query(Race)
+        .filter(Race.season == season, Race.race_number == race_number, Race.series == "cup")
+        .first()
+    )
+    if not race:
+        raise HTTPException(status_code=404,
+                            detail=f"No cup race found: season={season}, race_number={race_number}")
+
+    # Build loop_data lookup by driver name for fastest_laps + extra fields
+    loop_by_name = {}
+    for ld in loop_arr:
+        loop_by_name[ld["driver"].strip().lower()] = ld
+
+    # ── Process results ──────────────────────────────────────
+    saved_results = 0
+    saved_loop    = 0
+    unmatched     = []
+
+    for row in results_arr:
+        name           = row.get("driver", "").strip()
+        finish         = int(row.get("finish", 0))
+        start          = int(row.get("start", 0))
+        laps_completed = int(row.get("laps", 0))
+        laps_led       = int(row.get("laps_led", 0))
+        status_val     = row.get("status", "running").strip().lower()
+
+        if not name or not finish:
+            continue
+
+        driver_id = match_driver(db, name, season)
+        if not driver_id:
+            unmatched.append(name)
+            continue
+
+        # Get fastest_laps from loop data
+        ld_row = loop_by_name.get(name.lower(), {})
+        fastest_laps = int(ld_row.get("fastest_laps", 0))
+
+        # Calculate DK + FD points using scoring.py
+        pts = calc_all_points(
+            finish_position = finish,
+            start_position  = start,
+            laps_completed  = laps_completed,
+            laps_led        = laps_led,
+            fastest_laps    = fastest_laps,
+        )
+
+        # Upsert result
+        existing = db.query(Result).filter(
+            Result.race_id == race.id, Result.driver_id == driver_id
+        ).first()
+
+        result_data = dict(
+            finish_position     = finish,
+            start_position      = start,
+            laps_completed      = laps_completed,
+            laps_led            = laps_led,
+            status              = status_val,
+            fastest_lap         = fastest_laps > 0,
+            driver_rating       = float(ld_row.get("driver_rating", 0)) or None,
+            dk_points           = pts["dk_points"],
+            dk_place_pts        = pts["dk_place_pts"],
+            dk_place_diff_pts   = pts["dk_place_diff_pts"],
+            dk_laps_led_pts     = pts["dk_laps_led_pts"],
+            dk_fast_lap_pts     = pts["dk_fast_lap_pts"],
+            dk_laps_complete_pts= None,
+            dk_dominator_bonus  = None,
+            fd_points           = pts["fd_points"],
+            fd_place_pts        = pts["fd_place_pts"],
+            fd_place_diff_pts   = pts["fd_place_diff_pts"],
+            fd_laps_led_pts     = pts["fd_laps_led_pts"],
+            fd_fast_lap_pts     = 0.0,
+            fd_laps_complete_pts= pts["fd_laps_complete_pts"],
+        )
+
+        if existing:
+            for k, v in result_data.items():
+                setattr(existing, k, v)
+        else:
+            db.add(Result(race_id=race.id, driver_id=driver_id, **result_data))
+        saved_results += 1
+
+    # ── Process loop data ────────────────────────────────────
+    for ld in loop_arr:
+        name = ld.get("driver", "").strip()
+        if not name:
+            continue
+
+        driver_id = match_driver(db, name, season)
+        if not driver_id:
+            continue
+
+        loop_data = dict(
+            green_flag_passes    = int(ld.get("gf_passes", 0)),
+            green_flag_passed    = int(ld.get("gf_times_passed", 0)),
+            quality_passes       = int(ld.get("quality_passes", 0)),
+            avg_running_position = float(ld.get("avg_pos", 0)) or None,
+            fastest_laps         = int(ld.get("fastest_laps", 0)),
+            fastest_lap_pct      = None,
+            laps_in_top15        = int(ld.get("top15_laps", 0)),
+            pct_laps_in_top15    = float(ld.get("pct_top15", 0)) or None,
+            passing_differential = int(ld.get("pass_diff", 0)),
+            driver_rating        = float(ld.get("driver_rating", 0)) or None,
+        )
+
+        # Calculate fastest_lap_pct
+        total_laps = int(ld.get("total_laps", 0))
+        if total_laps > 0 and loop_data["fastest_laps"] > 0:
+            loop_data["fastest_lap_pct"] = round(
+                loop_data["fastest_laps"] / total_laps * 100, 2
+            )
+
+        existing_ld = db.query(LoopData).filter(
+            LoopData.race_id == race.id, LoopData.driver_id == driver_id
+        ).first()
+
+        if existing_ld:
+            for k, v in loop_data.items():
+                setattr(existing_ld, k, v)
+        else:
+            db.add(LoopData(race_id=race.id, driver_id=driver_id, **loop_data))
+        saved_loop += 1
+
+    # ── Update race metadata ─────────────────────────────────
+    if race_meta:
+        if race_meta.get("actual_laps"):
+            race.actual_laps = int(race_meta["actual_laps"])
+        if race_meta.get("cautions"):
+            race.caution_count = int(race_meta["cautions"])
+        if race_meta.get("caution_laps"):
+            race.caution_laps = int(race_meta["caution_laps"])
+        if race_meta.get("lead_changes"):
+            race.lead_changes = int(race_meta["lead_changes"])
+    race.status = "completed"
+
+    db.commit()
+
+    resp = {
+        "race_id":       race.id,
+        "race_name":     race.race_name,
+        "season":        season,
+        "race_number":   race_number,
+        "results_saved": saved_results,
+        "loop_saved":    saved_loop,
+    }
+    if unmatched:
+        resp["unmatched_drivers"] = unmatched
+
+    logger.info(f"Racing Reference load: {saved_results} results + {saved_loop} loop for {race.race_name}")
+    return resp
 
 
 @router.get("/data-status")

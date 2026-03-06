@@ -53,6 +53,9 @@ app.add_middleware(
         "https://draftkings.com",
         "https://www.fanduel.com",
         "https://fanduel.com",
+        # Racing Reference — allows the race results console script to POST here
+        "https://www.racing-reference.info",
+        "https://racing-reference.info",
     ],
     allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,

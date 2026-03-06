@@ -24,7 +24,7 @@ def calc_dk_points(finish_pos, start_pos, laps_led, fastest_lap, total_laps, lap
     """
     Wrapper around scoring.py's calc_dk_points for sim engine use.
     Adapts the boolean fastest_lap to a count, and returns a dict
-    with 'total' key for backward compatibility with results_scraper.
+    with 'total' key for internal use by the simulation engine.
     """
     fastest_laps = 1 if fastest_lap else 0
     result = _calc_dk(
@@ -33,7 +33,7 @@ def calc_dk_points(finish_pos, start_pos, laps_led, fastest_lap, total_laps, lap
         laps_led=laps_led,
         fastest_laps=fastest_laps,
     )
-    # Map to the dict format expected by results_scraper.py
+    # Map to the dict format used by the simulation engine
     return {
         "total": result["dk_points"],
         "place": result["dk_place_pts"],

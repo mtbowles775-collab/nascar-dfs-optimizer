@@ -3,8 +3,7 @@
 # 
 # SINGLE SOURCE OF TRUTH for all DFS scoring.
 # Called by:
-#   - backfill_scores.py (historical)
-#   - results scraper (future races)
+#   - admin.py Racing Reference endpoint (race results loading)
 #   - simulation engine (projections)
 # ============================================================
 
