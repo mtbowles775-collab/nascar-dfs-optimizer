@@ -288,6 +288,18 @@ class Salary(Base):
     driver          = relationship("Driver", back_populates="salaries")
 
 
+# ── Driver Name Aliases ──────────────────────────────────
+class DriverNameAlias(Base):
+    __tablename__ = "driver_name_aliases"
+    id            = Column(Integer, primary_key=True)
+    platform_name = Column(String(100), nullable=False)
+    driver_id     = Column(Integer, ForeignKey("drivers.id", ondelete="CASCADE"), nullable=False)
+    platform      = Column(String(20), default="all")
+    created_at    = Column(DateTime, server_default=func.now())
+    __table_args__ = (UniqueConstraint("platform_name", "platform"),)
+    driver        = relationship("Driver")
+
+
 # ── Simulations ──────────────────────────────────────────
 class Simulation(Base):
     __tablename__ = "simulations"

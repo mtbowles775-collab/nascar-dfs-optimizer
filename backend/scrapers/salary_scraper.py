@@ -33,33 +33,49 @@ def _normalize(name: str) -> str:
 
 def match_driver(db: Session, dk_name: str, race_season: int):
     """
-    Match a DK player name to our drivers table.
-    Tries: exact first+last -> last name only -> last word of name.
-    Normalizes accents and suffixes before comparing.
+    Match a DK/FD player name to our drivers table.
+    Priority:
+      0. Alias table lookup (handles known problem names like "J. Nemechek")
+      1. Exact first+last (normalized)
+      2. Last name only (with season disambiguation)
+      3. Last word of name (Jr. suffix edge cases)
     Returns driver_id or None.
     """
-    from models import Driver, DriverSeason
-    from sqlalchemy import func
+    from models import Driver, DriverSeason, DriverNameAlias
 
     clean = dk_name.strip()
+    if not clean:
+        return None
+
+    # ── Stage 0: Alias table (highest priority) ──────────
+    norm_clean = _normalize(clean)
+    alias = db.query(DriverNameAlias).filter(
+        DriverNameAlias.platform.in_(["all", "draftkings", "fanduel"]),
+    ).all()
+    for a in alias:
+        if _normalize(a.platform_name) == norm_clean:
+            logger.info(f"Alias match: '{dk_name}' → driver_id {a.driver_id}")
+            return a.driver_id
+
+    # ── Parse name parts ─────────────────────────────────
     parts = clean.split()
     if len(parts) < 2:
         return None
 
-    first     = parts[0]
-    last      = " ".join(parts[1:])   # handles "Jr.", "II", etc.
+    first      = parts[0]
+    last       = " ".join(parts[1:])
     norm_first = _normalize(first)
     norm_last  = _normalize(last)
 
-    # Pull all drivers and compare normalized — handles accents + Jr./Jr mismatches
+    # Pull all drivers once for comparison
     all_drivers = db.query(Driver).all()
 
-    # 1. Exact match first + last (normalized)
+    # ── Stage 1: Exact first + last (normalized) ─────────
     for d in all_drivers:
         if _normalize(d.first_name) == norm_first and _normalize(d.last_name) == norm_last:
             return d.id
 
-    # 2. Last name only (normalized)
+    # ── Stage 2: Last name only (normalized) ─────────────
     last_matches = [d for d in all_drivers if _normalize(d.last_name) == norm_last]
     if len(last_matches) == 1:
         return last_matches[0].id
@@ -73,7 +89,7 @@ def match_driver(db: Session, dk_name: str, race_season: int):
             if season_entry:
                 return m.id
 
-    # 3. Last word of name only (Jr. suffix edge cases)
+    # ── Stage 3: Last word of name (Jr. suffix edge cases)
     last_word      = parts[-1]
     norm_last_word = _normalize(last_word)
     if norm_last_word != norm_last:
