@@ -56,6 +56,9 @@ app.add_middleware(
         # Racing Reference — allows the race results console script to POST here
         "https://www.racing-reference.info",
         "https://racing-reference.info",
+        # NASCAR.com — allows the qualifying console script to POST here
+        "https://www.nascar.com",
+        "https://nascar.com",
     ],
     allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
