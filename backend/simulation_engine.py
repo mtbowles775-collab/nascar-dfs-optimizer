@@ -151,7 +151,7 @@ def _get_recency_weighted_avg(
             TrackType.name == track_type_name,
             col.isnot(None),
         )
-        .order_by(Race.race_date.desc())
+        .order_by(Race.season.desc(), Race.race_number.desc())
         .all()
     )
     if not rows:
@@ -186,7 +186,7 @@ def _get_recent_same_tt_avg(
             TrackType.name == track_type_name,
             col.isnot(None),
         )
-        .order_by(Race.race_date.desc())
+        .order_by(Race.season.desc(), Race.race_number.desc())
         .limit(n_races)
         .all()
     )
@@ -296,7 +296,7 @@ def _get_current_form(db: Session, driver_id: int, platform: str, n_races: int =
         db.query(Result.finish_position, col)
         .join(Race, Result.race_id == Race.id)
         .filter(Result.driver_id == driver_id, col.isnot(None))
-        .order_by(Race.race_date.desc())
+        .order_by(Race.season.desc(), Race.race_number.desc())
         .limit(n_races)
         .all()
     )
@@ -312,34 +312,56 @@ def _get_current_form(db: Session, driver_id: int, platform: str, n_races: int =
 
 
 def _get_track_type_form(db: Session, driver_id: int, track_type_name: str,
-                         platform: str) -> Dict:
+                         platform: str, n_races: int = 6) -> Dict:
     """
     Pull track-type-specific form for display.
-    Returns avg_finish and avg_pts at this track type (all history, recency-weighted).
+    Returns avg_finish over the last N races at this track type.
     """
-    col = Result.dk_points if platform == "draftkings" else Result.fd_points
     rows = (
-        db.query(Result.finish_position, col)
+        db.query(Result.finish_position)
         .join(Race, Result.race_id == Race.id)
         .join(Track, Race.track_id == Track.id)
         .join(TrackType, Track.track_type_id == TrackType.id)
         .filter(
             Result.driver_id == driver_id,
             TrackType.name == track_type_name,
-            col.isnot(None),
+            Result.finish_position.isnot(None),
         )
-        .order_by(Race.race_date.desc())
+        .order_by(Race.season.desc(), Race.race_number.desc())
+        .limit(n_races)
         .all()
     )
     if not rows:
-        return {"tt_form_finish": None, "tt_form_pts": None, "tt_form_races": 0}
+        return {"tt_form_finish": None, "tt_form_races": 0}
     finishes = [float(r[0]) for r in rows]
-    pts = [float(r[1]) for r in rows]
     return {
         "tt_form_finish": round(sum(finishes) / len(finishes), 1),
-        "tt_form_pts": round(sum(pts) / len(pts), 1),
         "tt_form_races": len(rows),
     }
+
+
+def _get_track_driver_rating(db: Session, driver_id: int, track_id: int,
+                              n_races: int = 5) -> Optional[float]:
+    """
+    Pull average driver rating at a SPECIFIC TRACK over the last N races.
+    More targeted than track-type-level rating.
+    """
+    rows = (
+        db.query(LoopData.driver_rating)
+        .join(Race, LoopData.race_id == Race.id)
+        .filter(
+            LoopData.driver_id == driver_id,
+            Race.track_id == track_id,
+            LoopData.driver_rating.isnot(None),
+        )
+        .order_by(Race.season.desc(), Race.race_number.desc())
+        .limit(n_races)
+        .all()
+    )
+    if not rows:
+        return None
+    vals = [float(r[0]) for r in rows]
+    return round(sum(vals) / len(vals), 1)
 
 
 # ── Profile builder ───────────────────────────────────────
@@ -424,6 +446,7 @@ def build_driver_profiles(
         # ── Display-only stats (passed through to frontend) ──
         current_form = _get_current_form(db, driver_id, platform)
         tt_form = _get_track_type_form(db, driver_id, track_type_name, platform)
+        track_rating = _get_track_driver_rating(db, driver_id, race.track_id)
 
         # ── Qualifying bonus ──
         # Starting upfront matters; scale by how many drivers
@@ -455,9 +478,8 @@ def build_driver_profiles(
             "current_form_pts":    current_form["current_form_pts"],
             "current_form_races":  current_form["current_form_races"],
             "tt_form_finish":      tt_form["tt_form_finish"],
-            "tt_form_pts":         tt_form["tt_form_pts"],
             "tt_form_races":       tt_form["tt_form_races"],
-            "driver_rating":       loop["avg_rating"],
+            "driver_rating":       track_rating,
             "avg_fl_count":        loop["avg_fl_count"],
         })
 
@@ -737,7 +759,6 @@ def run_simulation(
             "current_form_pts":    a.get("current_form_pts"),
             "current_form_races":  a.get("current_form_races"),
             "tt_form_finish":      a.get("tt_form_finish"),
-            "tt_form_pts":         a.get("tt_form_pts"),
             "tt_form_races":       a.get("tt_form_races"),
             "driver_rating":       a.get("driver_rating"),
             "avg_fast_laps":       round(avg_fl, 2),

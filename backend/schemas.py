@@ -213,10 +213,9 @@ class SimDriverResult(BaseModel):
     current_form_finish: Optional[float] = None   # avg finish over last 10 races (any track)
     current_form_pts: Optional[float] = None      # avg DK/FD pts over last 10 races
     current_form_races: Optional[int] = None      # how many races in the sample
-    tt_form_finish: Optional[float] = None        # avg finish at this track type (all history)
-    tt_form_pts: Optional[float] = None           # avg DK/FD pts at this track type
+    tt_form_finish: Optional[float] = None        # avg finish at this track type (last 6)
     tt_form_races: Optional[int] = None           # races at this track type in sample
-    driver_rating: Optional[float] = None         # loop data driver rating at this track type
+    driver_rating: Optional[float] = None         # loop data driver rating at this track (last 5)
     avg_fast_laps: Optional[float] = None         # simulated avg fast laps per race
 
 class SimulateResponse(BaseModel):
