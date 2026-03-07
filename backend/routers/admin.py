@@ -424,18 +424,11 @@ def get_sim_settings(db: Session = Depends(get_db)):
     """Return current simulation settings (singleton row)."""
     settings = db.query(SimSettings).filter(SimSettings.id == 1).first()
     if not settings:
-        # Auto-create with defaults if missing
-        settings = SimSettings(id=1, form_window=10, tt_form_window=6, recent_form_races=5, track_rating_window=5)
+        settings = SimSettings(id=1)
         db.add(settings)
         db.commit()
         db.refresh(settings)
-    return {
-        "form_window":          settings.form_window,
-        "tt_form_window":       settings.tt_form_window,
-        "recent_form_races":    settings.recent_form_races,
-        "track_rating_window":  settings.track_rating_window,
-        "updated_at":           str(settings.updated_at) if settings.updated_at else None,
-    }
+    return _settings_dict(settings)
 
 
 @router.put("/sim-settings")
@@ -446,14 +439,30 @@ def update_sim_settings(payload: dict, db: Session = Depends(get_db)):
         settings = SimSettings(id=1)
         db.add(settings)
 
-    ALLOWED = {"form_window", "tt_form_window", "recent_form_races", "track_rating_window"}
+    # Integer fields (sample sizes 1-50, weights 0-100, variance 10-300)
+    INT_FIELDS = {
+        "form_window": (1, 50), "tt_form_window": (1, 50),
+        "track_rating_window": (1, 50), "recent_form_races": (1, 50),
+        "w_finish_track_type": (0, 100), "w_finish_specific_track": (0, 100),
+        "w_finish_recent_form": (0, 100), "w_finish_loop_data": (0, 100),
+        "w_laps_led_loop": (0, 100), "w_fast_laps_loop": (0, 100),
+        "variance_finish": (10, 300), "variance_laps_led": (10, 300),
+        "variance_fast_laps": (10, 300),
+    }
+    BOOL_FIELDS = {"use_track_type", "use_specific_track", "use_recent_form"}
+
     updated = []
-    for key in ALLOWED:
+    for key, (lo, hi) in INT_FIELDS.items():
         if key in payload:
             val = int(payload[key])
-            if val < 1 or val > 50:
-                raise HTTPException(status_code=400, detail=f"{key} must be between 1 and 50")
+            if val < lo or val > hi:
+                raise HTTPException(status_code=400, detail=f"{key} must be between {lo} and {hi}")
             setattr(settings, key, val)
+            updated.append(key)
+
+    for key in BOOL_FIELDS:
+        if key in payload:
+            setattr(settings, key, bool(payload[key]))
             updated.append(key)
 
     if not updated:
@@ -463,15 +472,30 @@ def update_sim_settings(payload: dict, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(settings)
 
-    logger.info(f"Sim settings updated: {updated} → form_window={settings.form_window}, "
-                f"tt_form_window={settings.tt_form_window}, recent_form_races={settings.recent_form_races}, "
-                f"track_rating_window={settings.track_rating_window}")
+    logger.info(f"Sim settings updated: {updated}")
+    result = _settings_dict(settings)
+    result["updated_fields"] = updated
+    return result
 
+
+def _settings_dict(settings) -> dict:
+    """Convert SimSettings row to API response dict."""
     return {
-        "form_window":          settings.form_window,
-        "tt_form_window":       settings.tt_form_window,
-        "recent_form_races":    settings.recent_form_races,
-        "track_rating_window":  settings.track_rating_window,
-        "updated_at":           str(settings.updated_at),
-        "updated_fields":       updated,
+        "form_window":            settings.form_window,
+        "tt_form_window":         settings.tt_form_window,
+        "track_rating_window":    settings.track_rating_window,
+        "recent_form_races":      settings.recent_form_races,
+        "use_track_type":         settings.use_track_type,
+        "use_specific_track":     settings.use_specific_track,
+        "use_recent_form":        settings.use_recent_form,
+        "w_finish_track_type":    settings.w_finish_track_type,
+        "w_finish_specific_track":settings.w_finish_specific_track,
+        "w_finish_recent_form":   settings.w_finish_recent_form,
+        "w_finish_loop_data":     settings.w_finish_loop_data,
+        "w_laps_led_loop":        settings.w_laps_led_loop,
+        "w_fast_laps_loop":       settings.w_fast_laps_loop,
+        "variance_finish":        settings.variance_finish,
+        "variance_laps_led":      settings.variance_laps_led,
+        "variance_fast_laps":     settings.variance_fast_laps,
+        "updated_at":             str(settings.updated_at) if settings.updated_at else None,
     }

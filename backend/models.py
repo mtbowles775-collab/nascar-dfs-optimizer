@@ -347,11 +347,28 @@ class SimSettings(Base):
     """Singleton row (id=1) holding admin-configurable simulation parameters."""
     __tablename__ = "sim_settings"
     id                   = Column(Integer, primary_key=True, default=1)
-    form_window          = Column(Integer, nullable=False, default=10)   # "Base Form" — last N races (any track)
-    tt_form_window       = Column(Integer, nullable=False, default=6)    # "Type Avg" — last N at same track type
-    recent_form_races    = Column(Integer, nullable=False, default=5)    # blended into base score
-    track_rating_window  = Column(Integer, nullable=False, default=5)    # driver rating at specific track, last N
-    updated_at           = Column(DateTime, server_default=func.now())
+    # Sample sizes (N) for history buckets
+    form_window          = Column(Integer, nullable=False, default=10)   # Recent Form N — last N races (any track)
+    tt_form_window       = Column(Integer, nullable=False, default=6)    # Track Type N — last N at same track type
+    track_rating_window  = Column(Integer, nullable=False, default=5)    # Specific Track N — last N at exact track
+    recent_form_races    = Column(Integer, nullable=False, default=5)    # (legacy) blended into base score
+    # Toggles — which history buckets to include
+    use_track_type       = Column(Boolean, nullable=False, default=True)
+    use_specific_track   = Column(Boolean, nullable=False, default=True)
+    use_recent_form      = Column(Boolean, nullable=False, default=True)
+    # Weights for finish model (0-100 integer, divided by 100 in engine)
+    w_finish_track_type    = Column(Integer, nullable=False, default=35)
+    w_finish_specific_track= Column(Integer, nullable=False, default=25)
+    w_finish_recent_form   = Column(Integer, nullable=False, default=20)
+    w_finish_loop_data     = Column(Integer, nullable=False, default=20)
+    # Weights for laps led / fastest laps models
+    w_laps_led_loop        = Column(Integer, nullable=False, default=60)
+    w_fast_laps_loop       = Column(Integer, nullable=False, default=60)
+    # Variance controls (stored as integer, engine divides by 10)
+    variance_finish        = Column(Integer, nullable=False, default=100)
+    variance_laps_led      = Column(Integer, nullable=False, default=100)
+    variance_fast_laps     = Column(Integer, nullable=False, default=100)
+    updated_at             = Column(DateTime, server_default=func.now())
 
 
 class LineupDriver(Base):

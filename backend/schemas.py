@@ -219,10 +219,27 @@ class SimDriverResult(BaseModel):
     avg_fast_laps: Optional[float] = None         # simulated avg fast laps per race
 
 class SimSettingsOut(BaseModel):
+    # Sample sizes
     form_window: int = 10
     tt_form_window: int = 6
-    recent_form_races: int = 5
     track_rating_window: int = 5
+    recent_form_races: int = 5
+    # Toggles
+    use_track_type: bool = True
+    use_specific_track: bool = True
+    use_recent_form: bool = True
+    # Finish model weights (0-100)
+    w_finish_track_type: int = 35
+    w_finish_specific_track: int = 25
+    w_finish_recent_form: int = 20
+    w_finish_loop_data: int = 20
+    # Laps led / fastest laps model weights
+    w_laps_led_loop: int = 60
+    w_fast_laps_loop: int = 60
+    # Variance controls
+    variance_finish: int = 100
+    variance_laps_led: int = 100
+    variance_fast_laps: int = 100
 
 class SimulateResponse(BaseModel):
     simulation_id: int

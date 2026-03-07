@@ -1,15 +1,17 @@
 # ============================================================
-# simulation_engine.py  —  Phase 3 Monte Carlo Engine
+# simulation_engine.py  —  V2: Race-Outcome-First Engine
 # ============================================================
 #
-# Upgrades over V1:
-#   1. Recency-weighted track-type scoring (exponential decay)
-#   2. Power-law laps-led distribution (fitted to real data)
-#   3. Fast-lap distribution model (driver-level FL rate)
-#   4. Track-type-specific variance
-#   5. Rookie / thin-history handling
-#   6. Caution-based laps-led dispersion
-#   7. Improved ownership projection
+# Architecture:
+#   1. Build driver profiles from Admin-configurable history buckets
+#   2. Simulate FINISHING POSITION (independent model)
+#   3. Simulate LAPS LED (uses finish + loop data)
+#   4. Simulate FASTEST LAPS (uses finish + loop data)
+#   5. Apply qualifying / place differential
+#   6. Calculate DraftKings/FanDuel points as FINAL LAYER
+#
+# Key rule: DK/FD points are an OUTPUT of the simulation,
+#           never the basis of the simulation.
 #
 # Contract: run_simulation() returns List[Dict] consumed by
 # routers/simulate.py — output schema must stay compatible.
@@ -23,42 +25,14 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func, and_, desc
 from models import (
     Driver, Race, Result, Qualifying, Salary,
-    LoopData, DriverSeason, Track, TrackType,
+    LoopData, DriverSeason, Track, TrackType, SimSettings,
 )
 from scoring import calc_dk_points as _calc_dk, calc_fd_points as _calc_fd
 
 
-# ── Constants ──────────────────────────────────────────────
+# ── Empirical tables (from 15k+ results analysis) ───────
 
-# Exponential decay factors per track type (higher = more weight on old data)
-TRACK_TYPE_DECAY = {
-    "Flat":             0.92,   # half-life ~8 races at type
-    "Steep":            0.90,   # ~6
-    "Large Oval":       0.88,   # ~5
-    "Road":             0.85,   # ~4
-    "Restrictor Plate": 0.80,   # ~3
-}
-
-# How much of the final base score comes from track-type history vs recent form
-# (recent form is ALSO filtered to same track type now)
-TRACK_TYPE_HISTORY_WEIGHT = {
-    "Flat":             0.80,
-    "Steep":            0.80,
-    "Large Oval":       0.75,
-    "Road":             0.70,
-    "Restrictor Plate": 0.65,
-}
-
-# Noise (sigma) for Gaussian perturbation per track type
-TRACK_TYPE_SIGMA = {
-    "Flat":             11.0,
-    "Steep":            12.0,
-    "Large Oval":       10.0,
-    "Road":              9.0,
-    "Restrictor Plate": 14.0,
-}
-
-# Laps-led probability by finish position (from data analysis)
+# Laps-led probability by finish position
 # {finish_group_max: (pct_with_any_laps_led, avg_laps_led_if_leading)}
 LAPS_LED_BY_FINISH = {
     1:  (0.998, 79.6),
@@ -69,9 +43,9 @@ LAPS_LED_BY_FINISH = {
     40: (0.121,  2.0),
 }
 
-# Fast-lap distribution by finish position (from data analysis)
+# Fast-lap distribution by finish position
 FAST_LAPS_BY_FINISH = {
-    1:  (0.898, 29.4),    # (pct_with_any, avg_count)
+    1:  (0.898, 29.4),
     3:  (0.894, 17.9),
     5:  (0.873, 11.6),
     10: (0.780,  7.3),
@@ -79,24 +53,20 @@ FAST_LAPS_BY_FINISH = {
     40: (0.438,  2.4),
 }
 
-# Rookie / thin-history baseline DK points by salary tier
-ROOKIE_BASELINES = {
-    "high":   35.0,   # salary >= 9000
-    "mid":    28.0,   # salary 7000-8999
-    "low":    20.0,   # salary < 7000
+# Rookie baseline expected finishes by salary tier
+ROOKIE_FINISH_BASELINES = {
+    "high":   15.0,   # salary >= 9000
+    "mid":    22.0,   # salary 7000-8999
+    "low":    28.0,   # salary < 7000
 }
 
-# Field-average fallback when no salary info
-FIELD_AVG_FALLBACK = 25.0
-
-# Rookie noise is wider (more uncertainty)
+FIELD_AVG_FINISH = 20.0
 ROOKIE_SIGMA_MULTIPLIER = 1.4
 
 
-# ── Scoring wrappers ──────────────────────────────────────
+# ── Scoring wrappers ────────────────────────────────────
 
 def calc_dk_points(finish_pos, start_pos, laps_led, fastest_laps, total_laps, laps_completed):
-    """DK scoring via scoring.py. Returns dict with 'total' key."""
     result = _calc_dk(
         finish_position=finish_pos,
         start_position=start_pos,
@@ -113,7 +83,6 @@ def calc_dk_points(finish_pos, start_pos, laps_led, fastest_laps, total_laps, la
 
 
 def calc_fd_points(finish_pos, start_pos, laps_led, fastest_laps, total_laps, laps_completed):
-    """FD scoring via scoring.py. Returns float."""
     result = _calc_fd(
         finish_position=finish_pos,
         start_position=start_pos,
@@ -123,84 +92,198 @@ def calc_fd_points(finish_pos, start_pos, laps_led, fastest_laps, total_laps, la
     return result["fd_points"]
 
 
-# ── Data loaders ──────────────────────────────────────────
+# ── History bucket loaders ───────────────────────────────
+# These pull RACE OUTCOME data (finish, laps led, driver rating, etc.)
+# NOT DK/FD points. This is the core architectural change.
 
-def _get_track_type_name(race: Race) -> str:
-    """Safely extract track type name from race."""
-    if race.track and race.track.track_type:
-        return race.track.track_type.name
-    return "Large Oval"
-
-
-def _get_recency_weighted_avg(
-    db: Session, driver_id: int, track_type_name: str,
-    platform: str, decay_factor: float
-) -> Optional[float]:
+def _get_track_type_history(
+    db: Session, driver_id: int, track_type_name: str, n_races: int
+) -> Dict:
     """
-    Pull historical DK/FD points for a driver at this track type,
-    weighted by exponential decay (most recent race at this type = weight 1.0).
+    Last N races at the same TRACK TYPE.
+    Returns avg_finish, finish_variance, avg_laps_led, avg_driver_rating,
+    avg_running_pos, avg_fastest_laps, race_count.
     """
-    col = Result.dk_points if platform == "draftkings" else Result.fd_points
     rows = (
-        db.query(col, Race.race_date)
-        .join(Race, Result.race_id == Race.id)
-        .join(Track, Race.track_id == Track.id)
-        .join(TrackType, Track.track_type_id == TrackType.id)
-        .filter(
-            Result.driver_id == driver_id,
-            TrackType.name == track_type_name,
-            col.isnot(None),
+        db.query(
+            Result.finish_position,
+            Result.laps_led,
+            LoopData.driver_rating,
+            LoopData.avg_running_position,
+            LoopData.fastest_laps,
+            LoopData.laps_in_top5,
+            LoopData.green_flag_passes,
+            LoopData.green_flag_passed,
+            LoopData.pct_laps_in_top15,
         )
-        .order_by(Race.season.desc(), Race.race_number.desc())
-        .all()
-    )
-    if not rows:
-        return None
-
-    weighted_sum = 0.0
-    weight_sum = 0.0
-    for i, (pts, _) in enumerate(rows):
-        w = decay_factor ** i
-        weighted_sum += float(pts) * w
-        weight_sum += w
-
-    return weighted_sum / weight_sum if weight_sum > 0 else None
-
-
-def _get_recent_same_tt_avg(
-    db: Session, driver_id: int, track_type_name: str,
-    platform: str, n_races: int = 3
-) -> Optional[float]:
-    """
-    Pull average DK/FD points from last N races at the SAME track type.
-    This captures recent momentum filtered to the relevant surface.
-    """
-    col = Result.dk_points if platform == "draftkings" else Result.fd_points
-    rows = (
-        db.query(col)
         .join(Race, Result.race_id == Race.id)
         .join(Track, Race.track_id == Track.id)
         .join(TrackType, Track.track_type_id == TrackType.id)
+        .outerjoin(LoopData, and_(
+            LoopData.race_id == Result.race_id,
+            LoopData.driver_id == Result.driver_id,
+        ))
         .filter(
             Result.driver_id == driver_id,
             TrackType.name == track_type_name,
-            col.isnot(None),
+            Result.finish_position.isnot(None),
         )
         .order_by(Race.season.desc(), Race.race_number.desc())
         .limit(n_races)
         .all()
     )
-    vals = [float(r[0]) for r in rows]
-    return sum(vals) / len(vals) if vals else None
+    if not rows:
+        return {"race_count": 0}
+
+    finishes = [float(r[0]) for r in rows]
+    laps_led = [float(r[1] or 0) for r in rows]
+    ratings = [float(r[2]) for r in rows if r[2]]
+    run_pos = [float(r[3]) for r in rows if r[3]]
+    fast_laps = [float(r[4] or 0) for r in rows]
+    top5_laps = [float(r[5] or 0) for r in rows]
+    gf_passes = [float(r[6] or 0) for r in rows]
+    gf_passed = [float(r[7] or 0) for r in rows]
+    top15_pct = [float(r[8]) for r in rows if r[8]]
+
+    avg_finish = sum(finishes) / len(finishes)
+    finish_var = np.std(finishes) if len(finishes) > 1 else 8.0
+
+    return {
+        "avg_finish":       round(avg_finish, 2),
+        "finish_variance":  round(float(finish_var), 2),
+        "avg_laps_led":     round(sum(laps_led) / len(laps_led), 2) if laps_led else 0,
+        "avg_driver_rating":round(sum(ratings) / len(ratings), 1) if ratings else None,
+        "avg_running_pos":  round(sum(run_pos) / len(run_pos), 2) if run_pos else None,
+        "avg_fastest_laps": round(sum(fast_laps) / len(fast_laps), 2) if fast_laps else 0,
+        "avg_top5_laps":    round(sum(top5_laps) / len(top5_laps), 1) if top5_laps else 0,
+        "avg_gf_passes":    round(sum(gf_passes) / len(gf_passes), 1) if gf_passes else 0,
+        "avg_gf_passed":    round(sum(gf_passed) / len(gf_passed), 1) if gf_passed else 0,
+        "avg_top15_pct":    round(sum(top15_pct) / len(top15_pct), 1) if top15_pct else None,
+        "race_count":       len(rows),
+    }
 
 
-def _get_driver_loop_profile(
+def _get_specific_track_history(
+    db: Session, driver_id: int, track_id: int, n_races: int
+) -> Dict:
+    """
+    Last N races at the EXACT TRACK.
+    Same output shape as track type history.
+    """
+    rows = (
+        db.query(
+            Result.finish_position,
+            Result.laps_led,
+            LoopData.driver_rating,
+            LoopData.avg_running_position,
+            LoopData.fastest_laps,
+            LoopData.laps_in_top5,
+            LoopData.pct_laps_in_top15,
+        )
+        .join(Race, Result.race_id == Race.id)
+        .outerjoin(LoopData, and_(
+            LoopData.race_id == Result.race_id,
+            LoopData.driver_id == Result.driver_id,
+        ))
+        .filter(
+            Result.driver_id == driver_id,
+            Race.track_id == track_id,
+            Result.finish_position.isnot(None),
+        )
+        .order_by(Race.season.desc(), Race.race_number.desc())
+        .limit(n_races)
+        .all()
+    )
+    if not rows:
+        return {"race_count": 0}
+
+    finishes = [float(r[0]) for r in rows]
+    laps_led = [float(r[1] or 0) for r in rows]
+    ratings = [float(r[2]) for r in rows if r[2]]
+    run_pos = [float(r[3]) for r in rows if r[3]]
+    fast_laps = [float(r[4] or 0) for r in rows]
+    top5_laps = [float(r[5] or 0) for r in rows]
+    top15_pct = [float(r[6]) for r in rows if r[6]]
+
+    avg_finish = sum(finishes) / len(finishes)
+    finish_var = np.std(finishes) if len(finishes) > 1 else 8.0
+
+    return {
+        "avg_finish":       round(avg_finish, 2),
+        "finish_variance":  round(float(finish_var), 2),
+        "avg_laps_led":     round(sum(laps_led) / len(laps_led), 2) if laps_led else 0,
+        "avg_driver_rating":round(sum(ratings) / len(ratings), 1) if ratings else None,
+        "avg_running_pos":  round(sum(run_pos) / len(run_pos), 2) if run_pos else None,
+        "avg_fastest_laps": round(sum(fast_laps) / len(fast_laps), 2) if fast_laps else 0,
+        "avg_top5_laps":    round(sum(top5_laps) / len(top5_laps), 1) if top5_laps else 0,
+        "avg_top15_pct":    round(sum(top15_pct) / len(top15_pct), 1) if top15_pct else None,
+        "race_count":       len(rows),
+    }
+
+
+def _get_recent_form(
+    db: Session, driver_id: int, n_races: int
+) -> Dict:
+    """
+    Last N races at ANY track — overall recent form.
+    Same output shape as track type history.
+    """
+    rows = (
+        db.query(
+            Result.finish_position,
+            Result.laps_led,
+            LoopData.driver_rating,
+            LoopData.avg_running_position,
+            LoopData.fastest_laps,
+            LoopData.laps_in_top5,
+            LoopData.pct_laps_in_top15,
+        )
+        .join(Race, Result.race_id == Race.id)
+        .outerjoin(LoopData, and_(
+            LoopData.race_id == Result.race_id,
+            LoopData.driver_id == Result.driver_id,
+        ))
+        .filter(
+            Result.driver_id == driver_id,
+            Result.finish_position.isnot(None),
+        )
+        .order_by(Race.season.desc(), Race.race_number.desc())
+        .limit(n_races)
+        .all()
+    )
+    if not rows:
+        return {"race_count": 0}
+
+    finishes = [float(r[0]) for r in rows]
+    laps_led = [float(r[1] or 0) for r in rows]
+    ratings = [float(r[2]) for r in rows if r[2]]
+    run_pos = [float(r[3]) for r in rows if r[3]]
+    fast_laps = [float(r[4] or 0) for r in rows]
+    top5_laps = [float(r[5] or 0) for r in rows]
+    top15_pct = [float(r[6]) for r in rows if r[6]]
+
+    avg_finish = sum(finishes) / len(finishes)
+    finish_var = np.std(finishes) if len(finishes) > 1 else 8.0
+
+    return {
+        "avg_finish":       round(avg_finish, 2),
+        "finish_variance":  round(float(finish_var), 2),
+        "avg_laps_led":     round(sum(laps_led) / len(laps_led), 2) if laps_led else 0,
+        "avg_driver_rating":round(sum(ratings) / len(ratings), 1) if ratings else None,
+        "avg_running_pos":  round(sum(run_pos) / len(run_pos), 2) if run_pos else None,
+        "avg_fastest_laps": round(sum(fast_laps) / len(fast_laps), 2) if fast_laps else 0,
+        "avg_top5_laps":    round(sum(top5_laps) / len(top5_laps), 1) if top5_laps else 0,
+        "avg_top15_pct":    round(sum(top15_pct) / len(top15_pct), 1) if top15_pct else None,
+        "race_count":       len(rows),
+    }
+
+
+def _get_loop_profile(
     db: Session, driver_id: int, track_type_name: str
 ) -> Dict:
     """
-    Pull average loop-data metrics at this track type.
-    Returns: driver_rating, fastest_lap_pct, pct_laps_in_top15,
-             avg_running_position, fastest_laps_avg
+    Aggregate loop-data metrics at this track type (all available races).
+    These are the raw pace/control signals used by finish, laps-led, and fast-lap models.
     """
     row = (
         db.query(
@@ -210,6 +293,9 @@ def _get_driver_loop_profile(
             func.avg(LoopData.avg_running_position).label("avg_run_pos"),
             func.avg(LoopData.fastest_laps).label("avg_fl_count"),
             func.avg(LoopData.laps_in_top5).label("avg_top5_laps"),
+            func.avg(LoopData.green_flag_passes).label("avg_gf_passes"),
+            func.avg(LoopData.green_flag_passed).label("avg_gf_passed"),
+            func.avg(LoopData.passing_differential).label("avg_pass_diff"),
         )
         .join(Race, LoopData.race_id == Race.id)
         .join(Track, Race.track_id == Track.id)
@@ -218,21 +304,20 @@ def _get_driver_loop_profile(
         .first()
     )
     return {
-        "avg_rating":    float(row.avg_rating)    if row and row.avg_rating    else 80.0,
-        "avg_fl_pct":    float(row.avg_fl_pct)    if row and row.avg_fl_pct    else 3.0,
-        "avg_top15":     float(row.avg_top15)     if row and row.avg_top15     else 40.0,
-        "avg_run_pos":   float(row.avg_run_pos)   if row and row.avg_run_pos   else 20.0,
-        "avg_fl_count":  float(row.avg_fl_count)  if row and row.avg_fl_count  else 3.0,
-        "avg_top5_laps": float(row.avg_top5_laps) if row and row.avg_top5_laps else 0.0,
+        "avg_rating":     float(row.avg_rating)     if row and row.avg_rating     else 80.0,
+        "avg_fl_pct":     float(row.avg_fl_pct)     if row and row.avg_fl_pct     else 3.0,
+        "avg_top15":      float(row.avg_top15)      if row and row.avg_top15      else 40.0,
+        "avg_run_pos":    float(row.avg_run_pos)    if row and row.avg_run_pos    else 20.0,
+        "avg_fl_count":   float(row.avg_fl_count)   if row and row.avg_fl_count   else 3.0,
+        "avg_top5_laps":  float(row.avg_top5_laps)  if row and row.avg_top5_laps  else 0.0,
+        "avg_gf_passes":  float(row.avg_gf_passes)  if row and row.avg_gf_passes  else 0.0,
+        "avg_gf_passed":  float(row.avg_gf_passed)  if row and row.avg_gf_passed  else 0.0,
+        "avg_pass_diff":  float(row.avg_pass_diff)  if row and row.avg_pass_diff  else 0.0,
     }
 
 
 def _get_track_caution_rate(db: Session, track_type_name: str) -> float:
-    """
-    Average caution-laps-as-pct-of-total for this track type.
-    Higher = more cautions = laps led spread more evenly.
-    Returns a value between 0 and 1.
-    """
+    """Average caution-laps-as-pct-of-total for this track type."""
     row = (
         db.query(
             func.avg(
@@ -250,7 +335,6 @@ def _get_track_caution_rate(db: Session, track_type_name: str) -> float:
     )
     if row and row.avg_caution_pct:
         return min(float(row.avg_caution_pct), 0.5)
-    # Defaults by track type if no data
     defaults = {
         "Flat": 0.22, "Steep": 0.20, "Large Oval": 0.18,
         "Road": 0.12, "Restrictor Plate": 0.25,
@@ -259,7 +343,6 @@ def _get_track_caution_rate(db: Session, track_type_name: str) -> float:
 
 
 def _get_salary_tier(salary: Optional[int]) -> str:
-    """Map salary to tier for rookie baseline."""
     if salary is None:
         return "mid"
     if salary >= 9000:
@@ -269,118 +352,47 @@ def _get_salary_tier(salary: Optional[int]) -> str:
     return "low"
 
 
-def _count_driver_races_at_type(
-    db: Session, driver_id: int, track_type_name: str
-) -> int:
-    """How many completed races does this driver have at this track type?"""
-    return (
-        db.query(func.count(Result.id))
-        .join(Race, Result.race_id == Race.id)
-        .join(Track, Race.track_id == Track.id)
-        .join(TrackType, Track.track_type_id == TrackType.id)
-        .filter(
-            Result.driver_id == driver_id,
-            TrackType.name == track_type_name,
-        )
-        .scalar()
-    ) or 0
+def _get_track_type_name(race: Race) -> str:
+    if race.track and race.track.track_type:
+        return race.track.track_type.name
+    return "Large Oval"
 
 
-def _get_current_form(db: Session, driver_id: int, platform: str, n_races: int = 10) -> Dict:
-    """
-    Pull recent form stats (any track type) for display.
-    Returns avg_finish and avg_pts over the last N races.
-    """
-    col = Result.dk_points if platform == "draftkings" else Result.fd_points
-    rows = (
-        db.query(Result.finish_position, col)
-        .join(Race, Result.race_id == Race.id)
-        .filter(Result.driver_id == driver_id, col.isnot(None))
-        .order_by(Race.season.desc(), Race.race_number.desc())
-        .limit(n_races)
-        .all()
-    )
-    if not rows:
-        return {"current_form_finish": None, "current_form_pts": None, "current_form_races": 0}
-    finishes = [float(r[0]) for r in rows]
-    pts = [float(r[1]) for r in rows]
-    return {
-        "current_form_finish": round(sum(finishes) / len(finishes), 1),
-        "current_form_pts": round(sum(pts) / len(pts), 1),
-        "current_form_races": len(rows),
-    }
-
-
-def _get_track_type_form(db: Session, driver_id: int, track_type_name: str,
-                         platform: str, n_races: int = 6) -> Dict:
-    """
-    Pull track-type-specific form for display.
-    Returns avg_finish over the last N races at this track type.
-    """
-    rows = (
-        db.query(Result.finish_position)
-        .join(Race, Result.race_id == Race.id)
-        .join(Track, Race.track_id == Track.id)
-        .join(TrackType, Track.track_type_id == TrackType.id)
-        .filter(
-            Result.driver_id == driver_id,
-            TrackType.name == track_type_name,
-            Result.finish_position.isnot(None),
-        )
-        .order_by(Race.season.desc(), Race.race_number.desc())
-        .limit(n_races)
-        .all()
-    )
-    if not rows:
-        return {"tt_form_finish": None, "tt_form_races": 0}
-    finishes = [float(r[0]) for r in rows]
-    return {
-        "tt_form_finish": round(sum(finishes) / len(finishes), 1),
-        "tt_form_races": len(rows),
-    }
-
-
-def _get_track_driver_rating(db: Session, driver_id: int, track_id: int,
-                              n_races: int = 5) -> Optional[float]:
-    """
-    Pull average driver rating at a SPECIFIC TRACK over the last N races.
-    More targeted than track-type-level rating.
-    """
-    rows = (
-        db.query(LoopData.driver_rating)
-        .join(Race, LoopData.race_id == Race.id)
-        .filter(
-            LoopData.driver_id == driver_id,
-            Race.track_id == track_id,
-            LoopData.driver_rating.isnot(None),
-        )
-        .order_by(Race.season.desc(), Race.race_number.desc())
-        .limit(n_races)
-        .all()
-    )
-    if not rows:
-        return None
-    vals = [float(r[0]) for r in rows]
-    return round(sum(vals) / len(vals), 1)
-
-
-# ── Profile builder ───────────────────────────────────────
+# ── Profile builder ──────────────────────────────────────
 
 def build_driver_profiles(
-    db: Session, race: Race, platform: str, recent_form_races: int,
-    form_window: int = 10, tt_form_window: int = 6,
-    track_rating_window: int = 5,
+    db: Session, race: Race, platform: str, settings: SimSettings,
 ) -> List[Dict]:
     """
-    Build Phase 3 simulation profile for every driver entered in this race.
-    Each profile contains: base_score, is_rookie, loop metrics, qual data,
-    fast-lap rate, and track-type config.
+    Build simulation profiles using Admin-configurable history buckets.
+
+    For each driver, dynamically pull:
+      - last N same-track-type races (if toggle on)
+      - last N exact-track races (if toggle on)
+      - last N total recent races (if toggle on)
+
+    Compute expected finish from weighted blend + loop data.
+    NO DK/FD points are used in profile building.
     """
     track_type_name = _get_track_type_name(race)
-    total_laps      = race.scheduled_laps or 200  # fallback
-    decay_factor    = TRACK_TYPE_DECAY.get(track_type_name, 0.88)
-    history_weight  = TRACK_TYPE_HISTORY_WEIGHT.get(track_type_name, 0.75)
-    sigma           = TRACK_TYPE_SIGMA.get(track_type_name, 10.0)
+    total_laps      = race.scheduled_laps or 200
+
+    # Load settings
+    tt_n       = settings.tt_form_window       if settings else 6
+    st_n       = settings.track_rating_window  if settings else 5
+    rf_n       = settings.form_window          if settings else 10
+    use_tt     = settings.use_track_type       if settings else True
+    use_st     = settings.use_specific_track   if settings else True
+    use_rf     = settings.use_recent_form      if settings else True
+
+    # Weights (0-100 -> 0.0-1.0)
+    w_tt       = (settings.w_finish_track_type     if settings else 35) / 100.0
+    w_st       = (settings.w_finish_specific_track if settings else 25) / 100.0
+    w_rf       = (settings.w_finish_recent_form    if settings else 20) / 100.0
+    w_loop     = (settings.w_finish_loop_data      if settings else 20) / 100.0
+
+    # Variance
+    base_sigma = (settings.variance_finish if settings else 100) / 10.0  # default 10.0
 
     # Pre-load qualifying & salary maps
     qual_map = {
@@ -395,13 +407,11 @@ def build_driver_profiles(
         ).all()
     }
 
-    # Entrants = drivers with a salary this week
     active_driver_ids = list(sal_map.keys())
     if not active_driver_ids:
         active_drivers = db.query(Driver).filter(Driver.active == True).all()
         active_driver_ids = [d.id for d in active_drivers]
 
-    # Caution rate for laps-led dispersion
     caution_rate = _get_track_caution_rate(db, track_type_name)
 
     profiles = []
@@ -420,43 +430,101 @@ def build_driver_profiles(
         salary = sal_map.get(driver_id)
         start_pos = qual_map.get(driver_id)
 
-        # ── Base score: recency-weighted track-type avg ──
-        track_avg  = _get_recency_weighted_avg(db, driver_id, track_type_name, platform, decay_factor)
-        recent_avg = _get_recent_same_tt_avg(db, driver_id, track_type_name, platform, recent_form_races)
+        # ── Pull history buckets based on toggles ──
+        tt_hist = _get_track_type_history(db, driver_id, track_type_name, tt_n) if use_tt else {"race_count": 0}
+        st_hist = _get_specific_track_history(db, driver_id, race.track_id, st_n) if use_st else {"race_count": 0}
+        rf_hist = _get_recent_form(db, driver_id, rf_n) if use_rf else {"race_count": 0}
 
-        # Count races at this track type to detect thin history
-        race_count = _count_driver_races_at_type(db, driver_id, track_type_name)
-        is_rookie  = race_count < 5
+        # ── Loop data profile (always loaded) ──
+        loop = _get_loop_profile(db, driver_id, track_type_name)
 
-        if track_avg and recent_avg:
-            base_score = track_avg * history_weight + recent_avg * (1 - history_weight)
-        elif track_avg:
-            base_score = track_avg
-        elif recent_avg:
-            base_score = recent_avg
+        # ── Compute expected finish (weighted blend) ──
+        finish_components = []
+        active_weights = []
+
+        if use_tt and tt_hist["race_count"] > 0:
+            finish_components.append(tt_hist["avg_finish"])
+            active_weights.append(w_tt)
+
+        if use_st and st_hist["race_count"] > 0:
+            finish_components.append(st_hist["avg_finish"])
+            active_weights.append(w_st)
+
+        if use_rf and rf_hist["race_count"] > 0:
+            finish_components.append(rf_hist["avg_finish"])
+            active_weights.append(w_rf)
+
+        # Loop data contribution: avg_running_position is the best finish proxy
+        if loop["avg_run_pos"] and loop["avg_run_pos"] < 40:
+            finish_components.append(loop["avg_run_pos"])
+            active_weights.append(w_loop)
+
+        if finish_components and sum(active_weights) > 0:
+            # Normalize weights to sum to 1.0
+            total_w = sum(active_weights)
+            expected_finish = sum(
+                f * (w / total_w) for f, w in zip(finish_components, active_weights)
+            )
         else:
             # Rookie / no-history fallback
             tier = _get_salary_tier(salary)
-            base_score = ROOKIE_BASELINES[tier]
+            expected_finish = ROOKIE_FINISH_BASELINES[tier]
 
-        # Widen noise for rookies
-        driver_sigma = sigma * ROOKIE_SIGMA_MULTIPLIER if is_rookie else sigma
+        # ── Finish variance (from history or default) ──
+        variances = []
+        if tt_hist["race_count"] > 1:
+            variances.append(tt_hist["finish_variance"])
+        if rf_hist["race_count"] > 1:
+            variances.append(rf_hist["finish_variance"])
+        historical_var = sum(variances) / len(variances) if variances else 8.0
 
-        # ── Loop-data profile ──
-        loop = _get_driver_loop_profile(db, driver_id, track_type_name)
+        # Blend historical variance with admin-controlled base sigma
+        driver_sigma = (historical_var * 0.5 + base_sigma * 0.5)
 
-        # ── Display-only stats (passed through to frontend) ──
-        current_form = _get_current_form(db, driver_id, platform, n_races=form_window)
-        tt_form = _get_track_type_form(db, driver_id, track_type_name, platform, n_races=tt_form_window)
-        track_rating = _get_track_driver_rating(db, driver_id, race.track_id, n_races=track_rating_window)
+        # Widen for thin history
+        total_races = tt_hist["race_count"] + st_hist["race_count"] + rf_hist["race_count"]
+        is_rookie = total_races < 5
+        if is_rookie:
+            driver_sigma *= ROOKIE_SIGMA_MULTIPLIER
 
-        # ── Qualifying bonus ──
-        # Starting upfront matters; scale by how many drivers
-        qual_bonus = 0.0
-        if start_pos:
-            n_drivers = len(active_driver_ids)
-            # Top qualifier gets ~0.3 * n_drivers bonus, last gets 0
-            qual_bonus = max(0, (n_drivers - start_pos + 1)) * 0.3
+        # Driver rating multiplier (100 = average, so higher = stronger)
+        # Use it to slightly adjust expected finish: higher rating -> lower (better) finish
+        rating = loop["avg_rating"]
+        rating_adj = (100.0 - rating) * 0.05  # +5 rating -> 0.25 better finish
+        expected_finish = max(1.0, expected_finish + rating_adj)
+
+        # ── Laps-led strength (for laps-led model) ──
+        ll_history_avg = 0.0
+        ll_count = 0
+        if tt_hist["race_count"] > 0 and tt_hist.get("avg_laps_led"):
+            ll_history_avg += tt_hist["avg_laps_led"]
+            ll_count += 1
+        if st_hist["race_count"] > 0 and st_hist.get("avg_laps_led"):
+            ll_history_avg += st_hist["avg_laps_led"]
+            ll_count += 1
+        if rf_hist["race_count"] > 0 and rf_hist.get("avg_laps_led"):
+            ll_history_avg += rf_hist["avg_laps_led"]
+            ll_count += 1
+        ll_history_avg = ll_history_avg / ll_count if ll_count > 0 else 0
+
+        # ── Fastest-laps strength ──
+        fl_history_avg = 0.0
+        fl_count = 0
+        if tt_hist["race_count"] > 0 and tt_hist.get("avg_fastest_laps"):
+            fl_history_avg += tt_hist["avg_fastest_laps"]
+            fl_count += 1
+        if st_hist["race_count"] > 0 and st_hist.get("avg_fastest_laps"):
+            fl_history_avg += st_hist["avg_fastest_laps"]
+            fl_count += 1
+        if rf_hist["race_count"] > 0 and rf_hist.get("avg_fastest_laps"):
+            fl_history_avg += rf_hist["avg_fastest_laps"]
+            fl_count += 1
+        fl_history_avg = fl_history_avg / fl_count if fl_count > 0 else 0
+
+        # ── Display-only fields (backwards compatible with frontend) ──
+        current_form_finish = rf_hist.get("avg_finish") if rf_hist["race_count"] > 0 else None
+        tt_form_finish = tt_hist.get("avg_finish") if tt_hist["race_count"] > 0 else None
+        track_driver_rating = st_hist.get("avg_driver_rating") if st_hist["race_count"] > 0 else None
 
         profiles.append({
             "driver_id":        driver_id,
@@ -466,166 +534,186 @@ def build_driver_profiles(
             "manufacturer":     season_info.manufacturer.name if season_info and season_info.manufacturer else None,
             "salary":           salary,
             "start_position":   start_pos,
-            "base_score":       base_score,
-            "qual_bonus":       qual_bonus,
-            "loop":             loop,
-            "sigma":            driver_sigma,
+            # Core simulation inputs
+            "expected_finish":  round(expected_finish, 2),
+            "sigma":            round(driver_sigma, 2),
             "is_rookie":        is_rookie,
-            "race_count":       race_count,
             "total_laps":       total_laps,
             "track_type":       track_type_name,
             "caution_rate":     caution_rate,
-            # Display-only fields for frontend
-            "current_form_finish": current_form["current_form_finish"],
-            "current_form_pts":    current_form["current_form_pts"],
-            "current_form_races":  current_form["current_form_races"],
-            "tt_form_finish":      tt_form["tt_form_finish"],
-            "tt_form_races":       tt_form["tt_form_races"],
-            "driver_rating":       track_rating,
+            # Loop data
+            "loop":             loop,
+            # Laps-led and fast-lap model inputs
+            "ll_history_avg":   ll_history_avg,
+            "fl_history_avg":   fl_history_avg,
+            # Display-only fields (backwards compatible)
+            "current_form_finish": current_form_finish,
+            "current_form_pts":    None,  # No longer tracking DK pts in profiles
+            "current_form_races":  rf_hist["race_count"],
+            "tt_form_finish":      tt_form_finish,
+            "tt_form_races":       tt_hist["race_count"],
+            "driver_rating":       track_driver_rating,
             "avg_fl_count":        loop["avg_fl_count"],
         })
 
     return profiles
 
 
-# ── Sub-models for each sim iteration ─────────────────────
+# ── Step 1: Finish simulation ────────────────────────────
 
-def _simulate_finish_order(profiles: List[Dict]) -> List[int]:
+def _simulate_finish_order(profiles: List[Dict]) -> List[Tuple[int, int]]:
     """
-    Score each driver with noise and return finish order (list of driver_ids).
-    Uses driver rating as a multiplier on base score.
+    For each driver, sample from a distribution around their expected finish.
+    Rank all sampled values and assign actual finishing positions 1-N.
+
+    Returns list of (driver_id, assigned_finish_position).
     """
-    sim_scores = []
+    sampled = []
     for p in profiles:
-        # Driver rating: 100 = average, so /100 gives a multiplier near 1.0
-        rating_factor = p["loop"]["avg_rating"] / 100.0
-        noise = random.gauss(0, p["sigma"])
-        score = p["base_score"] * rating_factor + p["qual_bonus"] + noise
-        sim_scores.append((p["driver_id"], score))
+        # Sample: lower expected_finish is better, noise can move them up or down
+        raw_finish = random.gauss(p["expected_finish"], p["sigma"])
+        # Clamp to reasonable range
+        raw_finish = max(0.5, raw_finish)
+        sampled.append((p["driver_id"], raw_finish))
 
-    sim_scores.sort(key=lambda x: x[1], reverse=True)
-    return [driver_id for driver_id, _ in sim_scores]
+    # Sort by sampled finish (lower = better)
+    sampled.sort(key=lambda x: x[1])
 
+    # Assign actual positions 1, 2, 3, ...
+    return [(driver_id, pos + 1) for pos, (driver_id, _) in enumerate(sampled)]
+
+
+# ── Step 2: Laps led simulation ──────────────────────────
 
 def _simulate_laps_led(
-    finish_order: List[int], profiles_map: Dict, total_laps: int,
-    caution_rate: float
+    finish_results: List[Tuple[int, int]],
+    profiles_map: Dict,
+    total_laps: int,
+    caution_rate: float,
+    w_loop: float,
 ) -> Dict[int, int]:
     """
-    Power-law laps-led distribution.
+    Simulate laps led using:
+      - Finish position (from Step 1)
+      - Historical dominance (ll_history_avg)
+      - Loop data (driver rating, top5 laps)
+      - Caution rate (more cautions = more spread)
 
-    Uses empirical probabilities by finish position:
-      - Winner: ~80 laps avg, 99.8% lead at least 1
-      - 2-3: ~27 avg, 64% chance
-      - etc.
-
-    Caution rate affects concentration: more cautions = more lead changes
-    = laps spread more evenly (lower dominator share).
+    Loop data weight (w_loop) controls how much loop data matters vs finish position.
     """
-    n_drivers = len(finish_order)
-    laps_led = {d: 0 for d in finish_order}
+    n_drivers = len(finish_results)
+    laps_led = {d: 0 for d, _ in finish_results}
 
-    # Caution dispersion: high caution → reduce dominator concentration
-    # 0.20 caution rate = neutral, higher spreads more
-    dispersion = 1.0 + (caution_rate - 0.20) * 2.0  # range ~0.6 to 1.6
+    # Caution dispersion factor
+    dispersion = 1.0 + (caution_rate - 0.20) * 2.0
 
-    for idx, driver_id in enumerate(finish_order):
-        finish_pos = idx + 1
+    for driver_id, finish_pos in finish_results:
+        p = profiles_map[driver_id]
 
-        # Look up probability and avg from empirical table
+        # Empirical baseline from finish position
         prob, avg = _laps_led_for_position(finish_pos)
-
-        # Scale average by total_laps / 200 (data was mostly 200-lap races)
         scale = total_laps / 200.0
         avg_scaled = avg * scale
 
-        # Apply caution dispersion: more cautions = spread laps away from leader
+        # Loop data boost: driver_rating and historical laps-led
+        loop_boost = 1.0
+        if w_loop > 0:
+            rating = p["loop"]["avg_rating"]
+            # Above-average rating increases laps led chance
+            rating_factor = (rating / 100.0) ** 1.5  # exponential impact
+            # Historical laps-led gives direct boost
+            hist_ll = p.get("ll_history_avg", 0)
+            hist_factor = 1.0 + (hist_ll / max(total_laps, 1)) * 3.0
+            loop_boost = (1.0 - w_loop) + w_loop * rating_factor * hist_factor
+
+        avg_scaled *= loop_boost
+
+        # Apply caution dispersion
         if finish_pos <= 3:
-            # Top drivers lose share when there are more cautions
             avg_scaled *= max(0.4, 1.0 / dispersion)
         elif finish_pos > 10:
-            # Mid/back drivers gain a bit
             avg_scaled *= min(2.0, dispersion * 0.8)
 
-        # Roll whether this driver leads any laps
+        # Roll probability
         if random.random() > prob:
             continue
 
-        # Draw from exponential-ish distribution with the scaled mean
         laps = max(1, int(random.expovariate(1.0 / max(avg_scaled, 1.0))))
         laps_led[driver_id] = laps
 
-    # Clamp total to total_laps
+    # Clamp total
     total_led = sum(laps_led.values())
     if total_led > total_laps:
         scale_down = total_laps / total_led
         laps_led = {k: max(0, int(v * scale_down)) for k, v in laps_led.items()}
 
-    # Ensure at least 1 lap led for the winner
-    winner = finish_order[0]
-    if laps_led[winner] == 0:
-        laps_led[winner] = max(1, int(total_laps * 0.05))
+    # Winner must lead at least 1 lap
+    winner_id = finish_results[0][0]
+    if laps_led[winner_id] == 0:
+        laps_led[winner_id] = max(1, int(total_laps * 0.05))
 
     return laps_led
 
 
 def _laps_led_for_position(finish_pos: int) -> Tuple[float, float]:
-    """Return (probability_of_leading, avg_laps_if_leading) for a finish position."""
     for max_pos, (prob, avg) in sorted(LAPS_LED_BY_FINISH.items()):
         if finish_pos <= max_pos:
             return (prob, avg)
     return (0.10, 1.5)
 
 
+# ── Step 3: Fastest laps simulation ──────────────────────
+
 def _simulate_fast_laps(
-    finish_order: List[int], profiles_map: Dict, total_laps: int
+    finish_results: List[Tuple[int, int]],
+    laps_led_map: Dict[int, int],
+    profiles_map: Dict,
+    total_laps: int,
+    w_loop: float,
 ) -> Dict[int, int]:
     """
-    Distribute fastest-lap counts across the field.
+    Simulate fastest laps using:
+      - Finish position
+      - Laps led (correlation)
+      - Historical FL% from loop data
+      - Green flag speed signals
 
-    Unlike laps led (concentrated in winner), fast laps are spread more
-    broadly — even P20 drivers average 3.7 fast laps per race.
-
-    Uses two signals blended together:
-      1. Empirical rate by finish position (from data)
-      2. Driver's historical fastest_lap_pct at this track type (from loop data)
+    Fastest laps are correlated with laps led but not identical.
     """
-    n_drivers = len(finish_order)
-    fast_laps = {d: 0 for d in finish_order}
+    fast_laps = {d: 0 for d, _ in finish_results}
 
-    # Step 1: Compute each driver's expected FL share
     shares = {}
-    for idx, driver_id in enumerate(finish_order):
-        finish_pos = idx + 1
+    for driver_id, finish_pos in finish_results:
         p = profiles_map[driver_id]
 
         # Empirical baseline from finish position
         _, avg_fl = _fast_laps_for_position(finish_pos)
-        baseline_rate = avg_fl / 200.0  # normalize to per-lap rate
+        baseline_rate = avg_fl / 200.0
 
-        # Driver's historical FL% at this track type
-        hist_fl_pct = p["loop"]["avg_fl_pct"] / 100.0  # stored as percentage
+        # Loop data contribution: historical FL%
+        hist_fl_pct = p["loop"]["avg_fl_pct"] / 100.0
+        hist_fl_avg = p.get("fl_history_avg", 0) / max(total_laps, 1)
 
-        # Blend: 50% finish-position baseline + 50% historical driver skill
-        blended_rate = baseline_rate * 0.5 + hist_fl_pct * 0.5
+        # Laps led correlation: if you lead laps, you probably have fast laps
+        ll_bonus = (laps_led_map.get(driver_id, 0) / max(total_laps, 1)) * 0.3
 
-        # Clamp to reasonable range
-        blended_rate = max(0.005, min(blended_rate, 0.25))
+        # Blend
+        loop_signal = (hist_fl_pct + hist_fl_avg) / 2.0
+        blended = baseline_rate * (1.0 - w_loop) + (loop_signal + ll_bonus) * w_loop
 
-        shares[driver_id] = blended_rate
+        shares[driver_id] = max(0.005, min(blended, 0.25))
 
-    # Step 2: Normalize so total fast laps ≈ total_laps
+    # Normalize
     total_share = sum(shares.values())
     if total_share == 0:
         return fast_laps
 
-    for driver_id in finish_order:
+    for driver_id, _ in finish_results:
         expected = (shares[driver_id] / total_share) * total_laps
-        # Add noise: Poisson-like variability
         noisy = max(0, int(random.gauss(expected, max(1.0, expected * 0.4))))
         fast_laps[driver_id] = noisy
 
-    # Clamp total to total_laps
+    # Clamp
     total_fl = sum(fast_laps.values())
     if total_fl > total_laps:
         scale = total_laps / total_fl
@@ -635,38 +723,48 @@ def _simulate_fast_laps(
 
 
 def _fast_laps_for_position(finish_pos: int) -> Tuple[float, float]:
-    """Return (pct_with_any, avg_count) for a finish position."""
     for max_pos, (prob, avg) in sorted(FAST_LAPS_BY_FINISH.items()):
         if finish_pos <= max_pos:
             return (prob, avg)
     return (0.30, 1.5)
 
 
-# ── Main simulation ───────────────────────────────────────
+# ── Main simulation ─────────────────────────────────────
 
 def run_simulation(
     db: Session, race: Race, n_sims: int,
     platform: str = "draftkings",
+    settings: SimSettings = None,
+    # Legacy params (still accepted for backwards compatibility)
     recent_form_races: int = 5,
     form_window: int = 10,
     tt_form_window: int = 6,
     track_rating_window: int = 5,
 ) -> List[Dict]:
     """
-    Phase 3 Monte Carlo engine.
-    Returns a list of per-driver simulation result dicts.
+    V2 Race-Outcome-First Monte Carlo Engine.
+
+    For each simulation:
+      1. Simulate finishing positions
+      2. Simulate laps led
+      3. Simulate fastest laps
+      4. Apply qualifying (place differential)
+      5. Calculate DK/FD points as final layer
     """
-    profiles    = build_driver_profiles(db, race, platform, recent_form_races,
-                                        form_window=form_window, tt_form_window=tt_form_window,
-                                        track_rating_window=track_rating_window)
-    n_drivers   = len(profiles)
-    total_laps  = race.scheduled_laps or 200
+    # Load settings from DB if not provided
+    if settings is None:
+        settings = db.query(SimSettings).filter(SimSettings.id == 1).first()
 
-    # Build lookup map for fast access in inner loop
+    profiles = build_driver_profiles(db, race, platform, settings)
+    n_drivers = len(profiles)
+    total_laps = race.scheduled_laps or 200
+
     profiles_map = {p["driver_id"]: p for p in profiles}
-
-    # Get caution rate (same for all drivers at this track type)
     caution_rate = profiles[0]["caution_rate"] if profiles else 0.20
+
+    # Weights for sub-models
+    w_ll_loop = (settings.w_laps_led_loop if settings else 60) / 100.0
+    w_fl_loop = (settings.w_fast_laps_loop if settings else 60) / 100.0
 
     # Accumulators
     accum = {
@@ -681,24 +779,26 @@ def run_simulation(
     }
 
     for _ in range(n_sims):
-        # 1. Determine finish order
-        finish_order = _simulate_finish_order(profiles)
+        # Step 1: Simulate finish order
+        finish_results = _simulate_finish_order(profiles)
 
-        # 2. Distribute laps led (power-law)
-        laps_led_map = _simulate_laps_led(finish_order, profiles_map, total_laps, caution_rate)
+        # Step 2: Simulate laps led
+        laps_led_map = _simulate_laps_led(
+            finish_results, profiles_map, total_laps, caution_rate, w_ll_loop
+        )
 
-        # 3. Distribute fast laps
-        fast_laps_map = _simulate_fast_laps(finish_order, profiles_map, total_laps)
+        # Step 3: Simulate fastest laps
+        fast_laps_map = _simulate_fast_laps(
+            finish_results, laps_led_map, profiles_map, total_laps, w_fl_loop
+        )
 
-        # 4. Calculate fantasy points for each driver
-        for finish_idx, driver_id in enumerate(finish_order):
-            finish_pos      = finish_idx + 1
-            p               = accum[driver_id]
-            start_pos       = p["start_position"] or finish_pos
-            laps_led        = laps_led_map.get(driver_id, 0)
-            fastest_laps    = fast_laps_map.get(driver_id, 0)
-            # Laps completed: most drivers finish all laps unless DNF
-            laps_completed  = total_laps if finish_pos <= n_drivers * 0.85 else int(total_laps * 0.65)
+        # Steps 4 & 5: Apply qualifying + calculate DK/FD points
+        for driver_id, finish_pos in finish_results:
+            p = accum[driver_id]
+            start_pos = p["start_position"] or finish_pos
+            laps_led = laps_led_map.get(driver_id, 0)
+            fastest_laps = fast_laps_map.get(driver_id, 0)
+            laps_completed = total_laps if finish_pos <= n_drivers * 0.85 else int(total_laps * 0.65)
 
             if platform == "draftkings":
                 pts = calc_dk_points(finish_pos, start_pos, laps_led, fastest_laps,
@@ -707,10 +807,10 @@ def run_simulation(
                 pts = calc_fd_points(finish_pos, start_pos, laps_led, fastest_laps,
                                      total_laps, laps_completed)
 
-            p["fp_sum"]         += pts
-            p["finish_sum"]     += finish_pos
-            p["laps_led_sum"]   += laps_led
-            p["fast_lap_sum"]   += fastest_laps
+            p["fp_sum"]       += pts
+            p["finish_sum"]   += finish_pos
+            p["laps_led_sum"] += laps_led
+            p["fast_lap_sum"] += fastest_laps
             if finish_pos == 1:  p["wins"]  += 1
             if finish_pos <= 3:  p["top3"]  += 1
             if finish_pos <= 5:  p["top5"]  += 1
@@ -720,20 +820,19 @@ def run_simulation(
     # ── Aggregate results ──
     results = []
     for driver_id, a in accum.items():
-        sorted_fp   = sorted(a["all_fp"])
-        avg_fp      = a["fp_sum"] / n_sims
-        salary      = a["salary"] or 7000
-        value       = avg_fp / (salary / 1000) if salary else 0
-        avg_ll      = a["laps_led_sum"] / n_sims
-        avg_fl      = a["fast_lap_sum"] / n_sims
-        fl_pct      = avg_fl / total_laps if total_laps > 0 else 0
-        win_pct     = a["wins"] / n_sims
+        sorted_fp = sorted(a["all_fp"])
+        avg_fp    = a["fp_sum"] / n_sims
+        salary    = a["salary"] or 7000
+        value     = avg_fp / (salary / 1000) if salary else 0
+        avg_ll    = a["laps_led_sum"] / n_sims
+        avg_fl    = a["fast_lap_sum"] / n_sims
+        fl_pct    = avg_fl / total_laps if total_laps > 0 else 0
+        win_pct   = a["wins"] / n_sims
+        avg_finish = a["finish_sum"] / n_sims
 
-        # Dominator score: laps led + fast laps contribution
-        dom_score   = avg_ll * 0.25 + avg_fl * 0.10
+        dom_score = avg_ll * 0.25 + avg_fl * 0.10
 
-        # ── Ownership projection (improved) ──
-        # Primary drivers: salary rank is biggest ownership predictor
+        # Ownership projection
         salary_rank = _salary_rank(a["salary"], [p["salary"] for p in profiles])
         proj_own = _project_ownership(win_pct, value, salary_rank, n_drivers)
         leverage = avg_fp / proj_own if proj_own > 0 else 0
@@ -750,7 +849,7 @@ def run_simulation(
             "median_fp":        round(sorted_fp[int(n_sims * 0.5)], 2),
             "floor_fp":         round(sorted_fp[int(n_sims * 0.1)], 2),
             "ceiling_fp":       round(sorted_fp[int(n_sims * 0.9)], 2),
-            "avg_finish":       round(a["finish_sum"] / n_sims, 2),
+            "avg_finish":       round(avg_finish, 2),
             "avg_laps_led":     round(avg_ll, 2),
             "fast_lap_pct":     round(fl_pct, 4),
             "win_pct":          round(win_pct, 4),
@@ -761,7 +860,7 @@ def run_simulation(
             "leverage_score":   round(leverage, 2),
             "value":            round(value, 3),
             "dominator_score":  round(dom_score, 2),
-            # Phase 3: underlying metrics for display
+            # Display metrics (backwards compatible)
             "current_form_finish": a.get("current_form_finish"),
             "current_form_pts":    a.get("current_form_pts"),
             "current_form_races":  a.get("current_form_races"),
@@ -775,10 +874,9 @@ def run_simulation(
     return results
 
 
-# ── Ownership projection ──────────────────────────────────
+# ── Ownership projection ────────────────────────────────
 
 def _salary_rank(salary: Optional[int], all_salaries: List[Optional[int]]) -> float:
-    """Return 0-1 where 1 = highest salary. Used for ownership projection."""
     valid = sorted([s for s in all_salaries if s], reverse=True)
     if not salary or not valid:
         return 0.5
@@ -791,30 +889,14 @@ def _salary_rank(salary: Optional[int], all_salaries: List[Optional[int]]) -> fl
 
 def _project_ownership(win_pct: float, value: float, salary_rank: float,
                        n_drivers: int) -> float:
-    """
-    Improved ownership projection.
-    In DFS, salary rank is the #1 predictor of ownership (expensive = popular).
-    Win probability and value are secondary factors.
-    """
-    # Salary-driven base: top salary → ~25%, bottom → ~3%
     salary_base = 3.0 + salary_rank * 22.0
-
-    # Win probability boost
     win_boost = win_pct * 80.0
-
-    # Value boost (high value = popular in cash games)
     value_boost = max(0, (value - 3.0)) * 2.0
-
-    # Combine with noise
     raw = salary_base + win_boost + value_boost + random.gauss(0, 2.5)
-
-    # Normalize so total ownership ≈ n_drivers * (100 / lineup_size)
-    # For a 6-driver lineup, each slot has ~16.7% average ownership
-    # Total ownership across field should sum to ~600%
     return max(1.5, min(55.0, raw))
 
 
-# ── Lineup Optimizer ──────────────────────────────────────
+# ── Lineup Optimizer ────────────────────────────────────
 
 def optimize_lineups(
     sim_results: List[Dict], salary_cap: int, n_lineups: int,
@@ -824,8 +906,6 @@ def optimize_lineups(
 ) -> List[Dict]:
     """
     Generate N optimal DFS lineups from simulation results.
-    Uses a weighted-random greedy approach with correlation constraints
-    to ensure lineup diversity.
     """
     eligible = [
         r for r in sim_results
@@ -838,18 +918,17 @@ def optimize_lineups(
         base = r["avg_fp"] * 0.55 + r["ceiling_fp"] * 0.30 + r["floor_fp"] * 0.15
         return base * (1 + random.uniform(-randomness, randomness))
 
-    generated   = []
-    seen        = set()
-    attempts    = 0
+    generated = []
+    seen = set()
+    attempts = 0
     max_attempts = n_lineups * 50
 
     while len(generated) < n_lineups and attempts < max_attempts:
         attempts += 1
-        budget  = salary_cap
-        lineup  = []
-        used    = set()
+        budget = salary_cap
+        lineup = []
+        used = set()
 
-        # Force locked drivers first
         for locked_id in lock_drivers:
             driver = next((r for r in eligible if r["driver_id"] == locked_id), None)
             if driver and driver["salary"] <= budget:
@@ -860,11 +939,9 @@ def optimize_lineups(
         if len(lineup) > lineup_size:
             continue
 
-        # Fill remaining slots
         pool = sorted(
             [r for r in eligible if r["driver_id"] not in used],
-            key=score,
-            reverse=True
+            key=score, reverse=True
         )
 
         for driver in pool:
@@ -884,9 +961,9 @@ def optimize_lineups(
             continue
         seen.add(key)
 
-        total_salary    = sum(d["salary"] for d in lineup)
-        proj_fp         = sum(d["avg_fp"] for d in lineup)
-        proj_ceiling    = sum(d["ceiling_fp"] for d in lineup)
+        total_salary = sum(d["salary"] for d in lineup)
+        proj_fp = sum(d["avg_fp"] for d in lineup)
+        proj_ceiling = sum(d["ceiling_fp"] for d in lineup)
 
         generated.append({
             "lineup":           lineup,
