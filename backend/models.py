@@ -343,6 +343,16 @@ class Lineup(Base):
                                    cascade="all, delete-orphan")
 
 
+class SimSettings(Base):
+    """Singleton row (id=1) holding admin-configurable simulation parameters."""
+    __tablename__ = "sim_settings"
+    id                = Column(Integer, primary_key=True, default=1)
+    form_window       = Column(Integer, nullable=False, default=10)      # "Base Form" — last N races (any track)
+    tt_form_window    = Column(Integer, nullable=False, default=6)       # "TT Form" — last N at same track type
+    recent_form_races = Column(Integer, nullable=False, default=5)       # blended into base score
+    updated_at        = Column(DateTime, server_default=func.now())
+
+
 class LineupDriver(Base):
     __tablename__ = "lineup_drivers"
     id          = Column(Integer, primary_key=True)

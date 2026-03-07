@@ -218,6 +218,11 @@ class SimDriverResult(BaseModel):
     driver_rating: Optional[float] = None         # loop data driver rating at this track (last 5)
     avg_fast_laps: Optional[float] = None         # simulated avg fast laps per race
 
+class SimSettingsOut(BaseModel):
+    form_window: int = 10
+    tt_form_window: int = 6
+    recent_form_races: int = 5
+
 class SimulateResponse(BaseModel):
     simulation_id: int
     race_id: int
@@ -227,6 +232,7 @@ class SimulateResponse(BaseModel):
     n_sims: int
     qual_locked: bool
     ran_at: datetime
+    settings: Optional[SimSettingsOut] = None
     drivers: List[SimDriverResult]
 
 

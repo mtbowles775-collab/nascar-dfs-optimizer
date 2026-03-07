@@ -5,8 +5,8 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from database import get_db
-from models import Race, Result, LoopData, Qualifying
-from datetime import date
+from models import Race, Result, LoopData, Qualifying, SimSettings
+from datetime import date, datetime
 import logging
 
 logger = logging.getLogger(__name__)
@@ -414,4 +414,61 @@ def next_race_info(db: Session = Depends(get_db)):
         "qualifying":  qual_count,
         "salaries":    salary_count,
         "ready":       qual_count > 0 and salary_count > 0,
+    }
+
+
+# ── Sim Settings ──────────────────────────────────────────────
+
+@router.get("/sim-settings")
+def get_sim_settings(db: Session = Depends(get_db)):
+    """Return current simulation settings (singleton row)."""
+    settings = db.query(SimSettings).filter(SimSettings.id == 1).first()
+    if not settings:
+        # Auto-create with defaults if missing
+        settings = SimSettings(id=1, form_window=10, tt_form_window=6, recent_form_races=5)
+        db.add(settings)
+        db.commit()
+        db.refresh(settings)
+    return {
+        "form_window":       settings.form_window,
+        "tt_form_window":    settings.tt_form_window,
+        "recent_form_races": settings.recent_form_races,
+        "updated_at":        str(settings.updated_at) if settings.updated_at else None,
+    }
+
+
+@router.put("/sim-settings")
+def update_sim_settings(payload: dict, db: Session = Depends(get_db)):
+    """Update simulation settings. Accepts any subset of keys."""
+    settings = db.query(SimSettings).filter(SimSettings.id == 1).first()
+    if not settings:
+        settings = SimSettings(id=1)
+        db.add(settings)
+
+    ALLOWED = {"form_window", "tt_form_window", "recent_form_races"}
+    updated = []
+    for key in ALLOWED:
+        if key in payload:
+            val = int(payload[key])
+            if val < 1 or val > 50:
+                raise HTTPException(status_code=400, detail=f"{key} must be between 1 and 50")
+            setattr(settings, key, val)
+            updated.append(key)
+
+    if not updated:
+        raise HTTPException(status_code=400, detail="No valid settings provided")
+
+    settings.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(settings)
+
+    logger.info(f"Sim settings updated: {updated} → form_window={settings.form_window}, "
+                f"tt_form_window={settings.tt_form_window}, recent_form_races={settings.recent_form_races}")
+
+    return {
+        "form_window":       settings.form_window,
+        "tt_form_window":    settings.tt_form_window,
+        "recent_form_races": settings.recent_form_races,
+        "updated_at":        str(settings.updated_at),
+        "updated_fields":    updated,
     }

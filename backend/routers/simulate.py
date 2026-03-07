@@ -7,8 +7,8 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from database import get_db
-from models import Race, Simulation, SimulationDriverResult
-from schemas import SimulateRequest, SimulateResponse, SimDriverResult
+from models import Race, Simulation, SimulationDriverResult, SimSettings
+from schemas import SimulateRequest, SimulateResponse, SimDriverResult, SimSettingsOut
 from simulation_engine import run_simulation
 from datetime import datetime
 import json
@@ -28,13 +28,21 @@ def run_sim(req: SimulateRequest, db: Session = Depends(get_db)):
     qual_count  = db.query(Qualifying).filter(Qualifying.race_id == race.id).count()
     qual_locked = qual_count > 0
 
+    # Load sim settings from DB
+    settings = db.query(SimSettings).filter(SimSettings.id == 1).first()
+    form_window       = settings.form_window       if settings else 10
+    tt_form_window    = settings.tt_form_window    if settings else 6
+    recent_form_races = settings.recent_form_races if settings else req.recent_form_races
+
     # Run the simulation
     results = run_simulation(
         db=db,
         race=race,
         n_sims=req.n_sims,
         platform=req.platform,
-        recent_form_races=req.recent_form_races,
+        recent_form_races=recent_form_races,
+        form_window=form_window,
+        tt_form_window=tt_form_window,
     )
 
     # Persist simulation + per-driver results
@@ -44,7 +52,12 @@ def run_sim(req: SimulateRequest, db: Session = Depends(get_db)):
         ran_at          = datetime.utcnow(),
         qual_locked     = qual_locked,
         results_json    = results,
-        settings_json   = req.dict(),
+        settings_json   = {
+            **req.dict(),
+            "form_window":       form_window,
+            "tt_form_window":    tt_form_window,
+            "recent_form_races": recent_form_races,
+        },
     )
     db.add(sim)
     db.flush()  # get sim.id without committing
@@ -73,6 +86,12 @@ def run_sim(req: SimulateRequest, db: Session = Depends(get_db)):
 
     track_type = race.track.track_type.name if race.track and race.track.track_type else "Unknown"
 
+    sim_settings_out = SimSettingsOut(
+        form_window=form_window,
+        tt_form_window=tt_form_window,
+        recent_form_races=recent_form_races,
+    )
+
     return SimulateResponse(
         simulation_id   = sim.id,
         race_id         = race.id,
@@ -82,6 +101,7 @@ def run_sim(req: SimulateRequest, db: Session = Depends(get_db)):
         n_sims          = req.n_sims,
         qual_locked     = qual_locked,
         ran_at          = sim.ran_at,
+        settings        = sim_settings_out,
         drivers         = [SimDriverResult(**r) for r in results],
     )
 
@@ -103,6 +123,15 @@ def get_latest_sim(race_id: int, db: Session = Depends(get_db)):
 
     track_type = race.track.track_type.name if race.track and race.track.track_type else "Unknown"
 
+    # Pull settings from sim's settings_json if available, otherwise from DB
+    settings_json = sim.settings_json or {}
+    db_settings = db.query(SimSettings).filter(SimSettings.id == 1).first()
+    sim_settings_out = SimSettingsOut(
+        form_window=settings_json.get("form_window", db_settings.form_window if db_settings else 10),
+        tt_form_window=settings_json.get("tt_form_window", db_settings.tt_form_window if db_settings else 6),
+        recent_form_races=settings_json.get("recent_form_races", db_settings.recent_form_races if db_settings else 5),
+    )
+
     return SimulateResponse(
         simulation_id   = sim.id,
         race_id         = race.id,
@@ -112,5 +141,6 @@ def get_latest_sim(race_id: int, db: Session = Depends(get_db)):
         n_sims          = sim.n_sims,
         qual_locked     = sim.qual_locked,
         ran_at          = sim.ran_at,
+        settings        = sim_settings_out,
         drivers         = [SimDriverResult(**r) for r in sim.results_json],
     )
