@@ -286,6 +286,62 @@ def _count_driver_races_at_type(
     ) or 0
 
 
+def _get_current_form(db: Session, driver_id: int, platform: str, n_races: int = 10) -> Dict:
+    """
+    Pull recent form stats (any track type) for display.
+    Returns avg_finish and avg_pts over the last N races.
+    """
+    col = Result.dk_points if platform == "draftkings" else Result.fd_points
+    rows = (
+        db.query(Result.finish_position, col)
+        .join(Race, Result.race_id == Race.id)
+        .filter(Result.driver_id == driver_id, col.isnot(None))
+        .order_by(Race.race_date.desc())
+        .limit(n_races)
+        .all()
+    )
+    if not rows:
+        return {"current_form_finish": None, "current_form_pts": None, "current_form_races": 0}
+    finishes = [float(r[0]) for r in rows]
+    pts = [float(r[1]) for r in rows]
+    return {
+        "current_form_finish": round(sum(finishes) / len(finishes), 1),
+        "current_form_pts": round(sum(pts) / len(pts), 1),
+        "current_form_races": len(rows),
+    }
+
+
+def _get_track_type_form(db: Session, driver_id: int, track_type_name: str,
+                         platform: str) -> Dict:
+    """
+    Pull track-type-specific form for display.
+    Returns avg_finish and avg_pts at this track type (all history, recency-weighted).
+    """
+    col = Result.dk_points if platform == "draftkings" else Result.fd_points
+    rows = (
+        db.query(Result.finish_position, col)
+        .join(Race, Result.race_id == Race.id)
+        .join(Track, Race.track_id == Track.id)
+        .join(TrackType, Track.track_type_id == TrackType.id)
+        .filter(
+            Result.driver_id == driver_id,
+            TrackType.name == track_type_name,
+            col.isnot(None),
+        )
+        .order_by(Race.race_date.desc())
+        .all()
+    )
+    if not rows:
+        return {"tt_form_finish": None, "tt_form_pts": None, "tt_form_races": 0}
+    finishes = [float(r[0]) for r in rows]
+    pts = [float(r[1]) for r in rows]
+    return {
+        "tt_form_finish": round(sum(finishes) / len(finishes), 1),
+        "tt_form_pts": round(sum(pts) / len(pts), 1),
+        "tt_form_races": len(rows),
+    }
+
+
 # ── Profile builder ───────────────────────────────────────
 
 def build_driver_profiles(
@@ -365,6 +421,10 @@ def build_driver_profiles(
         # ── Loop-data profile ──
         loop = _get_driver_loop_profile(db, driver_id, track_type_name)
 
+        # ── Display-only stats (passed through to frontend) ──
+        current_form = _get_current_form(db, driver_id, platform)
+        tt_form = _get_track_type_form(db, driver_id, track_type_name, platform)
+
         # ── Qualifying bonus ──
         # Starting upfront matters; scale by how many drivers
         qual_bonus = 0.0
@@ -390,6 +450,15 @@ def build_driver_profiles(
             "total_laps":       total_laps,
             "track_type":       track_type_name,
             "caution_rate":     caution_rate,
+            # Display-only fields for frontend
+            "current_form_finish": current_form["current_form_finish"],
+            "current_form_pts":    current_form["current_form_pts"],
+            "current_form_races":  current_form["current_form_races"],
+            "tt_form_finish":      tt_form["tt_form_finish"],
+            "tt_form_pts":         tt_form["tt_form_pts"],
+            "tt_form_races":       tt_form["tt_form_races"],
+            "driver_rating":       loop["avg_rating"],
+            "avg_fl_count":        loop["avg_fl_count"],
         })
 
     return profiles
@@ -663,6 +732,15 @@ def run_simulation(
             "leverage_score":   round(leverage, 2),
             "value":            round(value, 3),
             "dominator_score":  round(dom_score, 2),
+            # Phase 3: underlying metrics for display
+            "current_form_finish": a.get("current_form_finish"),
+            "current_form_pts":    a.get("current_form_pts"),
+            "current_form_races":  a.get("current_form_races"),
+            "tt_form_finish":      a.get("tt_form_finish"),
+            "tt_form_pts":         a.get("tt_form_pts"),
+            "tt_form_races":       a.get("tt_form_races"),
+            "driver_rating":       a.get("driver_rating"),
+            "avg_fast_laps":       round(avg_fl, 2),
         })
 
     results.sort(key=lambda x: x["avg_fp"], reverse=True)
