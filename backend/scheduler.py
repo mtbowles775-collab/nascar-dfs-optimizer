@@ -37,7 +37,7 @@ def get_current_race_id() -> int | None:
 
 
 async def run_qualifying_scrape():
-    """Fired Friday night + Saturday night at 11pm ET."""
+    """Fired hourly on Fri/Sat 11am-11pm ET to catch qualifying whenever it posts."""
     race_id = get_current_race_id()
     if not race_id:
         logger.info("Qualifying scraper: no upcoming race found, skipping")
@@ -58,9 +58,17 @@ def start_scheduler():
     """Call this once when the FastAPI app starts."""
 
     # ── Qualifying (auto) ──
+    # Runs every hour on Friday and Saturday, 11am through 11pm ET
+    # Qualifying sessions can happen anytime during the day, so hourly
+    # coverage ensures we pick up results promptly after they post.
     scheduler.add_job(
         run_qualifying_scrape,
-        CronTrigger(day_of_week="fri,sat", hour=23, minute=0, timezone="America/New_York"),
+        CronTrigger(
+            day_of_week="fri,sat",
+            hour="11-23",
+            minute=0,
+            timezone="America/New_York",
+        ),
         id="qualifying_scraper",
         replace_existing=True,
     )
@@ -68,7 +76,7 @@ def start_scheduler():
     scheduler.start()
     logger.info(
         "Scheduler started — "
-        "qualifying (Fri/Sat 11pm ET). "
+        "qualifying (Fri/Sat hourly 11am-11pm ET). "
         "Race results: Racing Reference browser script. "
         "Salaries: DK/FD browser scripts."
     )

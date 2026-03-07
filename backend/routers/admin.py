@@ -24,6 +24,115 @@ async def trigger_qualifying(race_id: int, db: Session = Depends(get_db)):
     return {"race_id": race_id, "qualifying_saved": count}
 
 
+@router.post("/qualifying/load-from-browser")
+async def load_qualifying_from_browser(
+    payload: dict,
+    db: Session = Depends(get_db),
+):
+    """
+    Receives qualifying data fetched by the browser from NASCAR.com API,
+    matches drivers, and saves qualifying positions to the DB.
+
+    Payload: {
+      race_number: int,
+      season: int,
+      entries: [ { driver_name, car_number, position, best_lap_time, best_lap_speed } ]
+    }
+    """
+    from scrapers.salary_scraper import match_driver
+    from models import DriverSeason
+
+    race_number = payload.get("race_number")
+    season      = payload.get("season")
+    entries     = payload.get("entries", [])
+
+    if not race_number or not season:
+        raise HTTPException(status_code=400, detail="race_number and season required")
+    if not entries:
+        raise HTTPException(status_code=400, detail="No qualifying entries in payload")
+
+    # Find the race
+    race = (
+        db.query(Race)
+        .filter(Race.season == season, Race.race_number == race_number, Race.series == "cup")
+        .first()
+    )
+    if not race:
+        raise HTTPException(status_code=404,
+                            detail=f"No cup race found: season={season}, race_number={race_number}")
+
+    saved     = 0
+    unmatched = []
+
+    for entry in entries:
+        driver_name = entry.get("driver_name", "")
+        car_number  = str(entry.get("car_number", ""))
+        position    = int(entry.get("position", 0))
+        lap_time    = entry.get("best_lap_time")
+        lap_speed   = entry.get("best_lap_speed")
+
+        if position == 0:
+            continue
+
+        # Find driver by car number + season first
+        season_info = (
+            db.query(DriverSeason)
+            .filter(
+                DriverSeason.car_number == car_number,
+                DriverSeason.season     == season,
+            )
+            .first()
+        )
+
+        if season_info:
+            driver_id = season_info.driver_id
+        else:
+            # Fallback: match by name
+            driver_id = match_driver(db, driver_name, season)
+            if not driver_id:
+                unmatched.append(f"{driver_name} (#{car_number})")
+                continue
+
+        # Upsert qualifying record
+        existing = db.query(Qualifying).filter(
+            Qualifying.race_id   == race.id,
+            Qualifying.driver_id == driver_id,
+        ).first()
+
+        if existing:
+            existing.start_position = position
+            existing.lap_time_sec   = float(lap_time) if lap_time else None
+            existing.lap_speed_mph  = float(lap_speed) if lap_speed else None
+            existing.session_date   = datetime.utcnow()
+            existing.source         = "browser"
+        else:
+            db.add(Qualifying(
+                race_id         = race.id,
+                driver_id       = driver_id,
+                start_position  = position,
+                lap_time_sec    = float(lap_time) if lap_time else None,
+                lap_speed_mph   = float(lap_speed) if lap_speed else None,
+                session_date    = datetime.utcnow(),
+                source          = "browser",
+            ))
+        saved += 1
+
+    db.commit()
+
+    result = {
+        "race_id":     race.id,
+        "race_name":   race.race_name,
+        "race_number": race_number,
+        "season":      season,
+        "saved":       saved,
+    }
+    if unmatched:
+        result["unmatched_drivers"] = unmatched
+
+    logger.info(f"Browser qualifying load: {saved} saved for {race.race_name}")
+    return result
+
+
 @router.post("/salaries/load-from-browser")
 async def load_salaries_from_browser(
     payload: dict,
