@@ -222,6 +222,7 @@ class SimSettingsOut(BaseModel):
     form_window: int = 10
     tt_form_window: int = 6
     recent_form_races: int = 5
+    track_rating_window: int = 5
 
 class SimulateResponse(BaseModel):
     simulation_id: int

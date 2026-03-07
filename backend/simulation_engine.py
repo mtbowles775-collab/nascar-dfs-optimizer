@@ -369,6 +369,7 @@ def _get_track_driver_rating(db: Session, driver_id: int, track_id: int,
 def build_driver_profiles(
     db: Session, race: Race, platform: str, recent_form_races: int,
     form_window: int = 10, tt_form_window: int = 6,
+    track_rating_window: int = 5,
 ) -> List[Dict]:
     """
     Build Phase 3 simulation profile for every driver entered in this race.
@@ -447,7 +448,7 @@ def build_driver_profiles(
         # ── Display-only stats (passed through to frontend) ──
         current_form = _get_current_form(db, driver_id, platform, n_races=form_window)
         tt_form = _get_track_type_form(db, driver_id, track_type_name, platform, n_races=tt_form_window)
-        track_rating = _get_track_driver_rating(db, driver_id, race.track_id)
+        track_rating = _get_track_driver_rating(db, driver_id, race.track_id, n_races=track_rating_window)
 
         # ── Qualifying bonus ──
         # Starting upfront matters; scale by how many drivers
@@ -649,13 +650,15 @@ def run_simulation(
     recent_form_races: int = 5,
     form_window: int = 10,
     tt_form_window: int = 6,
+    track_rating_window: int = 5,
 ) -> List[Dict]:
     """
     Phase 3 Monte Carlo engine.
     Returns a list of per-driver simulation result dicts.
     """
     profiles    = build_driver_profiles(db, race, platform, recent_form_races,
-                                        form_window=form_window, tt_form_window=tt_form_window)
+                                        form_window=form_window, tt_form_window=tt_form_window,
+                                        track_rating_window=track_rating_window)
     n_drivers   = len(profiles)
     total_laps  = race.scheduled_laps or 200
 

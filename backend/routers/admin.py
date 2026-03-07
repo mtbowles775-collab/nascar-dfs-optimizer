@@ -425,15 +425,16 @@ def get_sim_settings(db: Session = Depends(get_db)):
     settings = db.query(SimSettings).filter(SimSettings.id == 1).first()
     if not settings:
         # Auto-create with defaults if missing
-        settings = SimSettings(id=1, form_window=10, tt_form_window=6, recent_form_races=5)
+        settings = SimSettings(id=1, form_window=10, tt_form_window=6, recent_form_races=5, track_rating_window=5)
         db.add(settings)
         db.commit()
         db.refresh(settings)
     return {
-        "form_window":       settings.form_window,
-        "tt_form_window":    settings.tt_form_window,
-        "recent_form_races": settings.recent_form_races,
-        "updated_at":        str(settings.updated_at) if settings.updated_at else None,
+        "form_window":          settings.form_window,
+        "tt_form_window":       settings.tt_form_window,
+        "recent_form_races":    settings.recent_form_races,
+        "track_rating_window":  settings.track_rating_window,
+        "updated_at":           str(settings.updated_at) if settings.updated_at else None,
     }
 
 
@@ -445,7 +446,7 @@ def update_sim_settings(payload: dict, db: Session = Depends(get_db)):
         settings = SimSettings(id=1)
         db.add(settings)
 
-    ALLOWED = {"form_window", "tt_form_window", "recent_form_races"}
+    ALLOWED = {"form_window", "tt_form_window", "recent_form_races", "track_rating_window"}
     updated = []
     for key in ALLOWED:
         if key in payload:
@@ -463,12 +464,14 @@ def update_sim_settings(payload: dict, db: Session = Depends(get_db)):
     db.refresh(settings)
 
     logger.info(f"Sim settings updated: {updated} → form_window={settings.form_window}, "
-                f"tt_form_window={settings.tt_form_window}, recent_form_races={settings.recent_form_races}")
+                f"tt_form_window={settings.tt_form_window}, recent_form_races={settings.recent_form_races}, "
+                f"track_rating_window={settings.track_rating_window}")
 
     return {
-        "form_window":       settings.form_window,
-        "tt_form_window":    settings.tt_form_window,
-        "recent_form_races": settings.recent_form_races,
-        "updated_at":        str(settings.updated_at),
-        "updated_fields":    updated,
+        "form_window":          settings.form_window,
+        "tt_form_window":       settings.tt_form_window,
+        "recent_form_races":    settings.recent_form_races,
+        "track_rating_window":  settings.track_rating_window,
+        "updated_at":           str(settings.updated_at),
+        "updated_fields":       updated,
     }

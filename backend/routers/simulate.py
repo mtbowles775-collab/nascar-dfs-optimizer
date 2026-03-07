@@ -30,9 +30,10 @@ def run_sim(req: SimulateRequest, db: Session = Depends(get_db)):
 
     # Load sim settings from DB
     settings = db.query(SimSettings).filter(SimSettings.id == 1).first()
-    form_window       = settings.form_window       if settings else 10
-    tt_form_window    = settings.tt_form_window    if settings else 6
-    recent_form_races = settings.recent_form_races if settings else req.recent_form_races
+    form_window          = settings.form_window          if settings else 10
+    tt_form_window       = settings.tt_form_window       if settings else 6
+    recent_form_races    = settings.recent_form_races    if settings else req.recent_form_races
+    track_rating_window  = settings.track_rating_window  if settings else 5
 
     # Run the simulation
     results = run_simulation(
@@ -43,6 +44,7 @@ def run_sim(req: SimulateRequest, db: Session = Depends(get_db)):
         recent_form_races=recent_form_races,
         form_window=form_window,
         tt_form_window=tt_form_window,
+        track_rating_window=track_rating_window,
     )
 
     # Persist simulation + per-driver results
@@ -54,9 +56,10 @@ def run_sim(req: SimulateRequest, db: Session = Depends(get_db)):
         results_json    = results,
         settings_json   = {
             **req.dict(),
-            "form_window":       form_window,
-            "tt_form_window":    tt_form_window,
-            "recent_form_races": recent_form_races,
+            "form_window":          form_window,
+            "tt_form_window":       tt_form_window,
+            "recent_form_races":    recent_form_races,
+            "track_rating_window":  track_rating_window,
         },
     )
     db.add(sim)
@@ -90,6 +93,7 @@ def run_sim(req: SimulateRequest, db: Session = Depends(get_db)):
         form_window=form_window,
         tt_form_window=tt_form_window,
         recent_form_races=recent_form_races,
+        track_rating_window=track_rating_window,
     )
 
     return SimulateResponse(
@@ -130,6 +134,7 @@ def get_latest_sim(race_id: int, db: Session = Depends(get_db)):
         form_window=settings_json.get("form_window", db_settings.form_window if db_settings else 10),
         tt_form_window=settings_json.get("tt_form_window", db_settings.tt_form_window if db_settings else 6),
         recent_form_races=settings_json.get("recent_form_races", db_settings.recent_form_races if db_settings else 5),
+        track_rating_window=settings_json.get("track_rating_window", db_settings.track_rating_window if db_settings else 5),
     )
 
     return SimulateResponse(
