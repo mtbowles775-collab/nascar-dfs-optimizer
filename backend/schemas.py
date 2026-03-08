@@ -217,6 +217,11 @@ class SimDriverResult(BaseModel):
     tt_form_races: Optional[int] = None           # races at this track type in sample
     driver_rating: Optional[float] = None         # loop data driver rating at this track (last 5)
     avg_fast_laps: Optional[float] = None         # simulated avg fast laps per race
+    # Scoring component averages
+    avg_place_pts: Optional[float] = None         # avg finish position points per sim
+    avg_diff_pts: Optional[float] = None          # avg place differential points per sim
+    avg_led_pts: Optional[float] = None           # avg laps led points per sim
+    avg_fl_pts: Optional[float] = None            # avg fastest lap points per sim
 
 class SimSettingsOut(BaseModel):
     # Sample sizes
