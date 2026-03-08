@@ -89,7 +89,13 @@ def calc_fd_points(finish_pos, start_pos, laps_led, fastest_laps, total_laps, la
         laps_completed=laps_completed,
         laps_led=laps_led,
     )
-    return result["fd_points"]
+    return {
+        "total": result["fd_points"],
+        "place": result["fd_place_pts"],
+        "diff":  result["fd_place_diff_pts"],
+        "led":   result["fd_laps_led_pts"],
+        "fl":    0.0,
+    }
 
 
 # ── History bucket loaders ───────────────────────────────
@@ -773,6 +779,8 @@ def run_simulation(
             "wins": 0, "top3": 0, "top5": 0, "top10": 0,
             "fp_sum": 0.0, "finish_sum": 0.0,
             "laps_led_sum": 0.0, "fast_lap_sum": 0.0,
+            "place_pts_sum": 0.0, "diff_pts_sum": 0.0,
+            "led_pts_sum": 0.0, "fl_pts_sum": 0.0,
             "all_fp": [],
         }
         for p in profiles
@@ -801,16 +809,21 @@ def run_simulation(
             laps_completed = total_laps if finish_pos <= n_drivers * 0.85 else int(total_laps * 0.65)
 
             if platform == "draftkings":
-                pts = calc_dk_points(finish_pos, start_pos, laps_led, fastest_laps,
-                                     total_laps, laps_completed)["total"]
+                score = calc_dk_points(finish_pos, start_pos, laps_led, fastest_laps,
+                                       total_laps, laps_completed)
             else:
-                pts = calc_fd_points(finish_pos, start_pos, laps_led, fastest_laps,
-                                     total_laps, laps_completed)
+                score = calc_fd_points(finish_pos, start_pos, laps_led, fastest_laps,
+                                       total_laps, laps_completed)
 
-            p["fp_sum"]       += pts
-            p["finish_sum"]   += finish_pos
-            p["laps_led_sum"] += laps_led
-            p["fast_lap_sum"] += fastest_laps
+            pts = score["total"]
+            p["fp_sum"]        += pts
+            p["finish_sum"]    += finish_pos
+            p["laps_led_sum"]  += laps_led
+            p["fast_lap_sum"]  += fastest_laps
+            p["place_pts_sum"] += score["place"]
+            p["diff_pts_sum"]  += score["diff"]
+            p["led_pts_sum"]   += score["led"]
+            p["fl_pts_sum"]    += score["fl"]
             if finish_pos == 1:  p["wins"]  += 1
             if finish_pos <= 3:  p["top3"]  += 1
             if finish_pos <= 5:  p["top5"]  += 1
@@ -831,6 +844,12 @@ def run_simulation(
         avg_finish = a["finish_sum"] / n_sims
 
         dom_score = avg_ll * 0.25 + avg_fl * 0.10
+
+        # Scoring component averages
+        avg_place_pts = a["place_pts_sum"] / n_sims
+        avg_diff_pts  = a["diff_pts_sum"]  / n_sims
+        avg_led_pts   = a["led_pts_sum"]   / n_sims
+        avg_fl_pts    = a["fl_pts_sum"]    / n_sims
 
         # Ownership projection
         salary_rank = _salary_rank(a["salary"], [p["salary"] for p in profiles])
@@ -860,6 +879,11 @@ def run_simulation(
             "leverage_score":   round(leverage, 2),
             "value":            round(value, 3),
             "dominator_score":  round(dom_score, 2),
+            # Scoring component averages
+            "avg_place_pts":    round(avg_place_pts, 2),
+            "avg_diff_pts":     round(avg_diff_pts, 2),
+            "avg_led_pts":      round(avg_led_pts, 2),
+            "avg_fl_pts":       round(avg_fl_pts, 2),
             # Display metrics (backwards compatible)
             "current_form_finish": a.get("current_form_finish"),
             "current_form_pts":    a.get("current_form_pts"),
